@@ -1,0 +1,149 @@
+# Function Description
+# Data Structures in ECMsgTypes.h
+struct ECSubRead {
+  pg_shard_t from;
+  ceph_tid_t tid;
+  map<hobject_t, list<boost::tuple<uint64_t, uint64_t, uint32_t> >> to_read;
+  set<hobject_t> attrs_to_read;
+  vector<int> symbol_ids; //a collection of symbols read from a node
+  void encode(bufferlist &bl, uint64_t features) const;
+  void decode(bufferlist::iterator &bl);
+  void dump(Formatter *f) const;
+  static void generate_test_instances(list<ECSubRead*>& o);
+};
+# Corresponding Functions in ECMsgTypes.cc
+void ECSubRead::encode(bufferlist &bl, uint64_t features) const;
+void ECSubRead::decode(bufferlist::iterator &bl);
+
+# Data Structures in ECBackend.h
+struct read_request_t {
+    const list<boost::tuple<uint64_t, uint64_t, uint32_t> > to_read;
+    const set<pg_shard_t> need;
+    const bool want_attrs;
+    GenContext<pair<RecoveryMessages *, read_result_t& > &> *cb;
+    map<pg_shard_t,vector<int> > solution;
+    read_request_t(
+      const list<boost::tuple<uint64_t, uint64_t, uint32_t> > &to_read,
+      const set<pg_shard_t> &need,
+      bool want_attrs,
+      GenContext<pair<RecoveryMessages *, read_result_t& > &> *cb)
+      : to_read(to_read), need(need), want_attrs(want_attrs),
+        cb(cb) {}
+    read_request_t(
+      const list<boost::tuple<uint64_t, uint64_t, uint32_t> > &to_read,
+      const set<pg_shard_t> &need,
+      bool want_attrs,
+      map<pg_shard_t,vector<int> > solution,
+      GenContext<pair<RecoveryMessages *, read_result_t& > &> * cb) : to_read(to_read), need(need), want_attrs(want_attrs),cb(cb)
+    {
+       this->solution.insert(solution.begin(),solution.end());
+    }
+};
+struct ReadOp {
+    int priority;
+    ceph_tid_t tid;
+    OpRequestRef op;
+    bool do_redundant_reads;
+    bool for_recovery;
+    map<hobject_t, read_request_t> to_read;
+    map<hobject_t, read_result_t> complete;
+    map<hobject_t, set<pg_shard_t>> obj_to_source;
+    map<pg_shard_t, set<hobject_t> > source_to_obj;
+    map<pg_shard_t,vector<int> > solution;
+    void dump(Formatter *f) const;
+    set<pg_shard_t> in_progress;
+	ReadOp(int priority,ceph_tid_t tid,bool do_redundant_reads,bool for_recovery,OpRequestRef op,map<hobject_t, read_request_t> &&_to_read)
+      : priority(priority), tid(tid), op(op), do_redundant_reads(do_redundant_reads),
+        for_recovery(for_recovery), to_read(std::move(_to_read)) {
+      for (auto &&hpair: to_read)
+      {
+               auto &returned = complete[hpair.first].returned;
+         if(!hpair.second.solution.empty())
+         {
+            this->solution.insert(hpair.second.solution.begin(),hpair.second.solution.end());
+         }
+               for (auto &&extent: hpair.second.to_read) {
+                   returned.push_back(
+                boost::make_tuple(
+                extent.get<0>(),
+                extent.get<1>(),
+                map<pg_shard_t, bufferlist>()));
+               }
+      }
+    }
+    ReadOp() = delete;
+    ReadOp(const ReadOp &) = default;
+    ReadOp(ReadOp &&) = default;
+};
+
+# Corresponding Functions in ECBackend.cc
+void ECBackend::run_recovery_op(RecoveryHandle *_h,int priority); //starting recovery;executing SA-RSR and obtaining symbol reading scheme
+
+void ECBackend::continue_recovery_op(RecoveryOp &op,RecoveryMessages *m); //recovery state machine
+
+int ECBackend::get_min_avail_to_read_shards_hybrid_solution(const hobject_t &hoid,const set<int> &want,bool for_recovery,bool do_redundant_reads,set<pg_shard_t> *to_read,map<pg_shard_t, vector<int> > solution); //the last parameter means the symbol reading scheme
+
+struct RecoveryMessages{void read_for_xor(ECBackend *ec, const hobject_t &hoid, uint64_t off, uint64_t len, const set<pg_shard_t> &need, bool attrs, map<pg_shard_t, vector<int> > solution)}; //building recovery messages
+
+void ECBackend::do_read_op(ReadOp &op); //building read requests
+
+void ECBackend::handle_sub_read(pg_shard_t from,const ECSubRead &op,ECSubReadReply *reply); //read the corresponding symbol data from the node
+
+void ECBackend::handle_recovery_read_complete(const hobject_t &hoid,boost::tuple<uint64_t, uint64_t, map<pg_shard_t, bufferlist> > &to_read,boost::optional<map<string, bufferlist> > attrs,RecoveryMessages *m); //Use the collected data for decoding
+
+/*
+*  The following functions are the execution procedures of Zpacr and SA-RSR.
+*/
+// Zpacr
+map<hobject_t, bool> xor_tech;
+int* crs_hybrid_parity_group_selection;
+int* crs_final_recovery_parity_vector;
+int* rows_intersection_infor;
+int* parity_group_selection;
+int crs_hybrid_profit;
+int crs_final_hybrid_profit;
+map<pg_shard_t,vector<int> > solution_pg_shard_t;
+map<int, vector<int> > solution_int;
+map<pg_shard_t, vector<int> >  hybrid_recovery_solution(const hobject_t &hoid, int k, int m, int faild_disk_id);
+int* crs_hybrid_recovery_solution(int k, int m, int w, int failed_disk_id,int *generator_matrix);
+void construct_rows_intersection_infor_matrix(int m, int k, int w, int failed_disk_id, int *generator_matrix);
+int different_failed_blocks(int m, int k, int w, int failed_disk_id, int param_row1, int param_row2, int *generator_matrix);
+int count_rows_intersections_num(int m, int k, int w, int failed_disk_id, int param_row1, int param_row2, int *generator_matrix);
+int calculate_blocks_savings( int m, int k, int w, int failed_disk_id, int *generator_matrix, int *crs_parity_group_selection);
+int crs_better_recovery_exist(int m, int k, int w, int failed_disk_id, int* candidate_replace_parity_groups, int *generator_matrix);
+int not_in_failed_disk_selection(int m, int k, int w, int failed_disk_id, int *generator_matrix,int row);
+void int2bin(int integer, int *binary, int array_len);
+int judge_the_better_candidate(int m, int w, int failed_disk_id, int candidate_one, int candidate_two);
+void crs_adjust_recovery_vector(int m, int k, int w, int failed_disk_id, int fixed_parity_disk, int star_parity_disk, int *generator_matrix);
+void crs_adjust_recovery_vector_in_adjustment(int m, int k, int w, int failed_disk_id, int fixed_parity_node, int star_parity_node, int pre_fixed_parity_node, int *generator_matrix);
+void crs_store_selection_to_final(int m, int w);
+void get_recovery_solution(int k, int m, int w, int failed_disk_id, int* generator_matrix,int* crs_parity_group_selection, map<int, vector<int> >& crs_solution);
+int get_min_avail_to_read_shards_hybrid_solution(const hobject_t &hoid,const set<int> &want,bool for_recovery,bool do_redundant_reads,set<pg_shard_t> *to_read,map<pg_shard_t, vector<int> > solution);
+// SA-RSR
+int* sa_crs_hybrid_parity_group_selection;
+int* sa_crs_hybrid_parity_group_selection_index;
+int* sa_crs_hybrid_parity_group_selection_best;
+int* sa_crs_hybrid_parity_group_selection_best_index;
+int* sa_crs_hybrid_parity_group_selection_temporary;
+int* sa_crs_hybrid_parity_group_selection_temporary_index;
+int** sa_crs_recovery_equation_group;
+int** sa_crs_recovery_equation_group_index;
+int* sa_crs_recovery_equation_group_index_number;
+int sa_crs_hybrid_profit;
+void init_crs_recovery_equation_group(int k,int m ,int w,int failed_disk_id,int *generator_matrix);
+int calculate_row_profit(int k, int w, int row, int faild_disk_id,int *generator_matrix);
+int calculate_all_profit(int k,int m,int w,int faild_disk_id,int *generator_matrix,int *sa_crs_hybrid_parity_group_selection);
+bool judge_row_selected(int m,int w, int row);
+void init_crs_hybrid_parity_group_selection(int k, int m, int w, int faild_disk_id, int *generator_matrix);
+void init_crs_hybrid_parity_group_selection_best(int k,int m,int w, int* generator_matrix);
+void init_crs_hybrid_parity_group_selection_temporary(int k, int m, int w,  int *generator_matrix);
+void receive_replacement(int m,int w);
+void remember_best(int m, int w);
+bool judge_row_selected_temporary(int m, int w, int row);
+void sa_int2bin(int integer, int *binary, int array_len);
+bool sa_judge_in_failed_disk_selection(int k,int m,int w,int failed_disk_id,int* generator_matrix,int row, int* temporary_group_id);
+void sa_search_recovery_solution(int k,int m,int w,int failed_disk_id,int *generator_matrix);
+int* sa_crs_hybrid_recovery_solution(int k, int m, int w, int failed_disk_id, int *generator_matrix);
+
+# Functions in ECUtil.cc
+int ECUtil::decode_for_xor(const stripe_info_t &sinfo,ErasureCodeInterfaceRef &ec_impl,map<int, bufferlist> &to_decode,map<int, bufferlist*> &out,map<int,vector<int> > solution,int w,int packet_size,int* parity_group_selection); //Interface of decoding operation

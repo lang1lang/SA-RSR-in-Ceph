@@ -1,0 +1,3306 @@
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
+// vim: ts=8 sw=2 smarttab
+/*
+ * Ceph - scalable distributed file system
+ *
+ * Copyright (C) 2013 Inktank Storage, Inc.
+ *
+ * This is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License version 2.1, as published by the Free Software
+ * Foundation.  See file COPYING.
+ *
+ */
+
+#include <iostream>
+#include <sstream>
+
+#include "ECBackend.h"
+#include "messages/MOSDPGPush.h"
+#include "messages/MOSDPGPushReply.h"
+#include "messages/MOSDECSubOpWrite.h"
+#include "messages/MOSDECSubOpWriteReply.h"
+#include "messages/MOSDECSubOpRead.h"
+#include "messages/MOSDECSubOpReadReply.h"
+#include "ECMsgTypes.h"
+
+#include "PrimaryLogPG.h"
+
+#define dout_context cct
+#define dout_subsys ceph_subsys_osd
+#define DOUT_PREFIX_ARGS this
+#undef dout_prefix
+#define dout_prefix _prefix(_dout, this)
+static ostream& _prefix(std::ostream *_dout, ECBackend *pgb) {
+  return *_dout << pgb->get_parent()->gen_dbg_prefix();
+}
+
+struct ECRecoveryHandle : public PGBackend::RecoveryHandle {
+  list<ECBackend::RecoveryOp> ops;
+};
+
+ostream &operator<<(ostream &lhs, const ECBackend::pipeline_state_t &rhs) {
+  switch (rhs.pipeline_state) {
+  case ECBackend::pipeline_state_t::CACHE_VALID:
+    return lhs << "CACHE_VALID";
+  case ECBackend::pipeline_state_t::CACHE_INVALID:
+    return lhs << "CACHE_INVALID";
+  default:
+    assert(0 == "invalid pipeline state");
+  }
+  return lhs; // unreachable
+}
+
+static ostream &operator<<(ostream &lhs, const map<pg_shard_t, bufferlist> &rhs)
+{
+  lhs << "[";
+  for (map<pg_shard_t, bufferlist>::const_iterator i = rhs.begin();
+       i != rhs.end();
+       ++i) {
+    if (i != rhs.begin())
+      lhs << ", ";
+    lhs << make_pair(i->first, i->second.length());
+  }
+  return lhs << "]";
+}
+
+static ostream &operator<<(ostream &lhs, const map<int, bufferlist> &rhs)
+{
+  lhs << "[";
+  for (map<int, bufferlist>::const_iterator i = rhs.begin();
+       i != rhs.end();
+       ++i) {
+    if (i != rhs.begin())
+      lhs << ", ";
+    lhs << make_pair(i->first, i->second.length());
+  }
+  return lhs << "]";
+}
+
+static ostream &operator<<(
+  ostream &lhs,
+  const boost::tuple<uint64_t, uint64_t, map<pg_shard_t, bufferlist> > &rhs)
+{
+  return lhs << "(" << rhs.get<0>() << ", "
+	     << rhs.get<1>() << ", " << rhs.get<2>() << ")";
+}
+
+ostream &operator<<(ostream &lhs, const ECBackend::read_request_t &rhs)
+{
+  return lhs << "read_request_t(to_read=[" << rhs.to_read << "]"
+	     << ", need=" << rhs.need
+	     << ", want_attrs=" << rhs.want_attrs
+	     << ")";
+}
+
+ostream &operator<<(ostream &lhs, const ECBackend::read_result_t &rhs)
+{
+  lhs << "read_result_t(r=" << rhs.r
+      << ", errors=" << rhs.errors;
+  if (rhs.attrs) {
+    lhs << ", attrs=" << rhs.attrs.get();
+  } else {
+    lhs << ", noattrs";
+  }
+  return lhs << ", returned=" << rhs.returned << ")";
+}
+
+ostream &operator<<(ostream &lhs, const ECBackend::ReadOp &rhs)
+{
+  lhs << "ReadOp(tid=" << rhs.tid;
+  if (rhs.op && rhs.op->get_req()) {
+    lhs << ", op=";
+    rhs.op->get_req()->print(lhs);
+  }
+  return lhs << ", to_read=" << rhs.to_read
+	     << ", complete=" << rhs.complete
+	     << ", priority=" << rhs.priority
+	     << ", obj_to_source=" << rhs.obj_to_source
+	     << ", source_to_obj=" << rhs.source_to_obj
+	     << ", in_progress=" << rhs.in_progress << ")";
+}
+
+void ECBackend::ReadOp::dump(Formatter *f) const
+{
+  f->dump_unsigned("tid", tid);
+  if (op && op->get_req()) {
+    f->dump_stream("op") << *(op->get_req());
+  }
+  f->dump_stream("to_read") << to_read;
+  f->dump_stream("complete") << complete;
+  f->dump_int("priority", priority);
+  f->dump_stream("obj_to_source") << obj_to_source;
+  f->dump_stream("source_to_obj") << source_to_obj;
+  f->dump_stream("in_progress") << in_progress;
+}
+
+ostream &operator<<(ostream &lhs, const ECBackend::Op &rhs)
+{
+  lhs << "Op(" << rhs.hoid
+      << " v=" << rhs.version
+      << " tt=" << rhs.trim_to
+      << " tid=" << rhs.tid
+      << " reqid=" << rhs.reqid;
+  if (rhs.client_op && rhs.client_op->get_req()) {
+    lhs << " client_op=";
+    rhs.client_op->get_req()->print(lhs);
+  }
+  lhs << " roll_forward_to=" << rhs.roll_forward_to
+      << " temp_added=" << rhs.temp_added
+      << " temp_cleared=" << rhs.temp_cleared
+      << " pending_read=" << rhs.pending_read
+      << " remote_read=" << rhs.remote_read
+      << " remote_read_result=" << rhs.remote_read_result
+      << " pending_apply=" << rhs.pending_apply
+      << " pending_commit=" << rhs.pending_commit
+      << " plan.to_read=" << rhs.plan.to_read
+      << " plan.will_write=" << rhs.plan.will_write
+      << ")";
+  return lhs;
+}
+
+ostream &operator<<(ostream &lhs, const ECBackend::RecoveryOp &rhs)
+{
+  return lhs << "RecoveryOp("
+	     << "hoid=" << rhs.hoid
+	     << " v=" << rhs.v
+	     << " missing_on=" << rhs.missing_on
+	     << " missing_on_shards=" << rhs.missing_on_shards
+	     << " recovery_info=" << rhs.recovery_info
+	     << " recovery_progress=" << rhs.recovery_progress
+	     << " obc refcount=" << rhs.obc.use_count()
+	     << " state=" << ECBackend::RecoveryOp::tostr(rhs.state)
+	     << " waiting_on_pushes=" << rhs.waiting_on_pushes
+	     << " extent_requested=" << rhs.extent_requested
+	     << ")";
+}
+
+void ECBackend::RecoveryOp::dump(Formatter *f) const
+{
+  f->dump_stream("hoid") << hoid;
+  f->dump_stream("v") << v;
+  f->dump_stream("missing_on") << missing_on;
+  f->dump_stream("missing_on_shards") << missing_on_shards;
+  f->dump_stream("recovery_info") << recovery_info;
+  f->dump_stream("recovery_progress") << recovery_progress;
+  f->dump_stream("state") << tostr(state);
+  f->dump_stream("waiting_on_pushes") << waiting_on_pushes;
+  f->dump_stream("extent_requested") << extent_requested;
+}
+
+ECBackend::ECBackend(
+  PGBackend::Listener *pg,
+  coll_t coll,
+  ObjectStore::CollectionHandle &ch,
+  ObjectStore *store,
+  CephContext *cct,
+  ErasureCodeInterfaceRef ec_impl,
+  uint64_t stripe_width)
+  : PGBackend(cct, pg, store, coll, ch),
+    ec_impl(ec_impl),
+    sinfo(ec_impl->get_data_chunk_count(), stripe_width) {
+  assert((ec_impl->get_data_chunk_count() *
+	  ec_impl->get_chunk_size(stripe_width)) == stripe_width);
+}
+
+PGBackend::RecoveryHandle *ECBackend::open_recovery_op()
+{
+  return new ECRecoveryHandle;
+}
+
+void ECBackend::_failed_push(const hobject_t &hoid,
+  pair<RecoveryMessages *, ECBackend::read_result_t &> &in)
+{
+  ECBackend::read_result_t &res = in.second;
+  dout(10) << __func__ << ": Read error " << hoid << " r="
+	   << res.r << " errors=" << res.errors << dendl;
+  dout(10) << __func__ << ": canceling recovery op for obj " << hoid
+	   << dendl;
+  assert(recovery_ops.count(hoid));
+  recovery_ops.erase(hoid);
+
+  list<pg_shard_t> fl;
+  for (auto&& i : res.errors) {
+    fl.push_back(i.first);
+  }
+  get_parent()->failed_push(fl, hoid);
+}
+
+struct OnRecoveryReadComplete :
+  public GenContext<pair<RecoveryMessages*, ECBackend::read_result_t& > &> {
+  ECBackend *pg;
+  hobject_t hoid;
+  set<int> want;
+  OnRecoveryReadComplete(ECBackend *pg, const hobject_t &hoid)
+    : pg(pg), hoid(hoid) {}
+  void finish(pair<RecoveryMessages *, ECBackend::read_result_t &> &in) override {
+    ECBackend::read_result_t &res = in.second;
+    if (!(res.r == 0 && res.errors.empty())) {
+        pg->_failed_push(hoid, in);
+        return;
+    }
+    assert(res.returned.size() == 1);
+    pg->handle_recovery_read_complete(
+      hoid,
+      res.returned.back(),
+      res.attrs,
+      in.first);
+  }
+};
+
+struct RecoveryMessages {
+  map<hobject_t,
+      ECBackend::read_request_t> reads;
+  void read(ECBackend *ec, const hobject_t &hoid, uint64_t off, uint64_t len, const set<pg_shard_t> &need, bool attrs) {
+    list<boost::tuple<uint64_t, uint64_t, uint32_t> > to_read;
+    to_read.push_back(boost::make_tuple(off, len, 0));
+    assert(!reads.count(hoid));
+    reads.insert(make_pair(hoid, ECBackend::read_request_t(to_read, need, attrs, new OnRecoveryReadComplete(ec, hoid))));
+  }
+  void read_for_xor(ECBackend *ec, const hobject_t &hoid, uint64_t off, uint64_t len, const set<pg_shard_t> &need, bool attrs, map<pg_shard_t, vector<int> > solution) {
+    list<boost::tuple<uint64_t, uint64_t, uint32_t> > to_read;
+    to_read.push_back(boost::make_tuple(off, len, 0));
+    assert(!reads.count(hoid));
+    reads.insert(make_pair(hoid,ECBackend::read_request_t(to_read,need,attrs,solution,new OnRecoveryReadComplete(ec,hoid))));
+  }
+  map<pg_shard_t, vector<PushOp> > pushes;
+  map<pg_shard_t, vector<PushReplyOp> > push_replies;
+  ObjectStore::Transaction t;
+  RecoveryMessages() {}
+  ~RecoveryMessages(){}
+};
+
+void ECBackend::handle_recovery_push(
+  const PushOp &op,
+  RecoveryMessages *m)
+{
+  ostringstream ss;
+  if (get_parent()->check_failsafe_full(ss)) {
+    dout(10) << __func__ << " Out of space (failsafe) processing push request: " << ss.str() << dendl;
+    ceph_abort();
+  }
+
+  bool oneshot = op.before_progress.first && op.after_progress.data_complete;
+  ghobject_t tobj;
+  if (oneshot) {
+    tobj = ghobject_t(op.soid, ghobject_t::NO_GEN,
+		      get_parent()->whoami_shard().shard);
+  } else {
+    tobj = ghobject_t(get_parent()->get_temp_recovery_object(op.soid,
+							     op.version),
+		      ghobject_t::NO_GEN,
+		      get_parent()->whoami_shard().shard);
+    if (op.before_progress.first) {
+      dout(10) << __func__ << ": Adding oid "
+	       << tobj.hobj << " in the temp collection" << dendl;
+      add_temp_obj(tobj.hobj);
+    }
+  }
+
+  if (op.before_progress.first) {
+    m->t.remove(coll, tobj);
+    m->t.touch(coll, tobj);
+  }
+
+  if (!op.data_included.empty()) {
+    uint64_t start = op.data_included.range_start();
+    uint64_t end = op.data_included.range_end();
+    assert(op.data.length() == (end - start));
+
+    m->t.write(
+      coll,
+      tobj,
+      start,
+      op.data.length(),
+      op.data);
+  } else {
+    assert(op.data.length() == 0);
+  }
+
+  if (op.before_progress.first) {
+    assert(op.attrset.count(string("_")));
+    m->t.setattrs(
+      coll,
+      tobj,
+      op.attrset);
+  }
+
+  if (op.after_progress.data_complete && !oneshot) {
+    dout(10) << __func__ << ": Removing oid "
+	     << tobj.hobj << " from the temp collection" << dendl;
+    clear_temp_obj(tobj.hobj);
+    m->t.remove(coll, ghobject_t(
+	op.soid, ghobject_t::NO_GEN, get_parent()->whoami_shard().shard));
+    m->t.collection_move_rename(
+      coll, tobj,
+      coll, ghobject_t(
+	op.soid, ghobject_t::NO_GEN, get_parent()->whoami_shard().shard));
+  }
+  if (op.after_progress.data_complete) {
+    if ((get_parent()->pgb_is_primary())) {
+      assert(recovery_ops.count(op.soid));
+      assert(recovery_ops[op.soid].obc);
+      get_parent()->on_local_recover(
+	op.soid,
+	op.recovery_info,
+	recovery_ops[op.soid].obc,
+	&m->t);
+    } else {
+      get_parent()->on_local_recover(
+	op.soid,
+	op.recovery_info,
+	ObjectContextRef(),
+	&m->t);
+    }
+  }
+  m->push_replies[get_parent()->primary_shard()].push_back(PushReplyOp());
+  m->push_replies[get_parent()->primary_shard()].back().soid = op.soid;
+}
+
+void ECBackend::handle_recovery_push_reply(
+  const PushReplyOp &op,
+  pg_shard_t from,
+  RecoveryMessages *m)
+{
+  if (!recovery_ops.count(op.soid))
+    return;
+  RecoveryOp &rop = recovery_ops[op.soid];
+  assert(rop.waiting_on_pushes.count(from));
+  rop.waiting_on_pushes.erase(from);
+  continue_recovery_op(rop, m);
+}
+
+void ECBackend::handle_recovery_read_complete(
+  const hobject_t &hoid,
+  boost::tuple<uint64_t, uint64_t, map<pg_shard_t, bufferlist> > &to_read,
+  boost::optional<map<string, bufferlist> > attrs,
+  RecoveryMessages *m)
+{
+  dout(10) << __func__ << ": returned " << hoid << " "
+	   << "(" << to_read.get<0>()
+	   << ", " << to_read.get<1>()
+	   << ", " << to_read.get<2>()
+	   << ")"
+	   << dendl;
+  assert(recovery_ops.count(hoid));
+  RecoveryOp &op = recovery_ops[hoid];
+  assert(op.returned_data.empty());
+  map<int, bufferlist*> target;
+  for (set<shard_id_t>::iterator i = op.missing_on_shards.begin(); i != op.missing_on_shards.end(); ++i) {
+    target[*i] = &(op.returned_data[*i]);
+  }
+  map<int, bufferlist> from;
+  for(map<pg_shard_t, bufferlist>::iterator i = to_read.get<2>().begin(); i != to_read.get<2>().end(); ++i) {
+    from[i->first.shard].claim(i->second);
+  }
+  dout(10) << __func__ << ": " << from << dendl;
+  int r = -1;
+  string profile = get_parent()->get_pool().erasure_code_profile;
+  string technique = get_osdmap()->get_erasure_code_profile(profile).find("technique")->second;
+  if((technique == "cauchy_good" || technique == "liber8tion" || technique == "blaum_roth") && !solution_int.empty()){ 
+     int w = ec_impl->get_symbol_count();
+     int packet_size = ec_impl->get_packetsize();
+     r = ECUtil::decode_for_xor(sinfo, ec_impl, from, target, solution_int, w, packet_size,parity_group_selection);
+  }else{
+  	r = ECUtil::decode(sinfo, ec_impl, from, target);
+  }
+  assert(r == 0);
+  if (attrs) {
+    op.xattrs.swap(*attrs);
+
+    if (!op.obc) {
+      // attrs only reference the origin bufferlist (decode from ECSubReadReply message)
+      // whose size is much greater than attrs in recovery. If obc cache it (get_obc maybe
+      // cache the attr), this causes the whole origin bufferlist would not be free until
+      // obc is evicted from obc cache. So rebuild the bufferlist before cache it.
+      for (map<string, bufferlist>::iterator it = op.xattrs.begin();
+           it != op.xattrs.end();
+           ++it) {
+        it->second.rebuild();
+      }
+      // Need to remove ECUtil::get_hinfo_key() since it should not leak out
+      // of the backend (see bug #12983)
+      map<string, bufferlist> sanitized_attrs(op.xattrs);
+      sanitized_attrs.erase(ECUtil::get_hinfo_key());
+      op.obc = get_parent()->get_obc(hoid, sanitized_attrs);
+      assert(op.obc);
+      op.recovery_info.size = op.obc->obs.oi.size;
+      op.recovery_info.oi = op.obc->obs.oi;
+    }
+
+    ECUtil::HashInfo hinfo(ec_impl->get_chunk_count());
+    if (op.obc->obs.oi.size > 0) {
+      assert(op.xattrs.count(ECUtil::get_hinfo_key()));
+      bufferlist::iterator bp = op.xattrs[ECUtil::get_hinfo_key()].begin();
+      ::decode(hinfo, bp);
+    }
+    op.hinfo = unstable_hashinfo_registry.lookup_or_create(hoid, hinfo);
+  }
+  assert(op.xattrs.size());
+  assert(op.obc);
+  continue_recovery_op(op, m);
+}
+
+struct SendPushReplies : public Context {
+  PGBackend::Listener *l;
+  epoch_t epoch;
+  map<int, MOSDPGPushReply*> replies;
+  SendPushReplies(
+    PGBackend::Listener *l,
+    epoch_t epoch,
+    map<int, MOSDPGPushReply*> &in) : l(l), epoch(epoch) {
+    replies.swap(in);
+  }
+  void finish(int) override {
+    for (map<int, MOSDPGPushReply*>::iterator i = replies.begin();
+	 i != replies.end();
+	 ++i) {
+      l->send_message_osd_cluster(i->first, i->second, epoch);
+    }
+    replies.clear();
+  }
+  ~SendPushReplies() override {
+    for (map<int, MOSDPGPushReply*>::iterator i = replies.begin();
+	 i != replies.end();
+	 ++i) {
+      i->second->put();
+    }
+    replies.clear();
+  }
+};
+
+void ECBackend::dispatch_recovery_messages(RecoveryMessages &m, int priority)
+{
+  for (map<pg_shard_t, vector<PushOp> >::iterator i = m.pushes.begin();
+       i != m.pushes.end();
+       m.pushes.erase(i++)) {
+    MOSDPGPush *msg = new MOSDPGPush();
+    msg->set_priority(priority);
+    msg->map_epoch = get_parent()->get_epoch();
+    msg->from = get_parent()->whoami_shard();
+    msg->pgid = spg_t(get_parent()->get_info().pgid.pgid, i->first.shard);
+    msg->pushes.swap(i->second);
+    msg->compute_cost(cct);
+    get_parent()->send_message(
+      i->first.osd,
+      msg);
+  }
+  map<int, MOSDPGPushReply*> replies;
+  for (map<pg_shard_t, vector<PushReplyOp> >::iterator i =
+	 m.push_replies.begin();
+       i != m.push_replies.end();
+       m.push_replies.erase(i++)) {
+    MOSDPGPushReply *msg = new MOSDPGPushReply();
+    msg->set_priority(priority);
+    msg->map_epoch = get_parent()->get_epoch();
+    msg->from = get_parent()->whoami_shard();
+    msg->pgid = spg_t(get_parent()->get_info().pgid.pgid, i->first.shard);
+    msg->replies.swap(i->second);
+    msg->compute_cost(cct);
+    replies.insert(make_pair(i->first.osd, msg));
+  }
+
+  if (!replies.empty()) {
+    (m.t).register_on_complete(
+	get_parent()->bless_context(
+	  new SendPushReplies(
+	    get_parent(),
+	    get_parent()->get_epoch(),
+	    replies)));
+    get_parent()->queue_transaction(std::move(m.t));
+  } 
+
+  if (m.reads.empty())
+    return;
+  start_read_op(
+    priority,
+    m.reads,
+    OpRequestRef(),
+    false, true);
+}
+
+void ECBackend::continue_recovery_op(
+  RecoveryOp &op,
+  RecoveryMessages *m)
+{
+  dout(10) << __func__ << ": continuing " << op << dendl;
+  while (1) {
+    switch (op.state) {
+    case RecoveryOp::IDLE: {
+      // start read
+      op.state = RecoveryOp::READING;
+      assert(!op.recovery_progress.data_complete);
+      set<int> want(op.missing_on_shards.begin(), op.missing_on_shards.end());
+      uint64_t from = op.recovery_progress.data_recovered_to;
+      uint64_t amount = get_recovery_chunk_size();
+
+      if (op.recovery_progress.first && op.obc) {
+	/* We've got the attrs and the hinfo, might as well use them */
+	op.hinfo = get_hash_info(op.hoid);
+	assert(op.hinfo);
+	op.xattrs = op.obc->attr_cache;
+	::encode(*(op.hinfo), op.xattrs[ECUtil::get_hinfo_key()]);
+      }
+
+      set<pg_shard_t> to_read;
+      int r = -1;
+      if(xor_tech.find(op.hoid) != xor_tech.end()){
+      	r = get_min_avail_to_read_shards_hybrid_solution(op.hoid, want, true, false, &to_read, ECBackend::solution_pg_shard_t);
+      }else{
+      	r = get_min_avail_to_read_shards(op.hoid, want, true, false, &to_read);
+      } 
+      if (r != 0) {
+	// we must have lost a recovery source
+	assert(!op.recovery_progress.first);
+	dout(10) << __func__ << ": canceling recovery op for obj " << op.hoid << dendl;
+	get_parent()->cancel_pull(op.hoid);
+	recovery_ops.erase(op.hoid);
+	return;
+      }
+      if(xor_tech.find(op.hoid) != xor_tech.end()){
+      	m->read_for_xor(this,op.hoid,op.recovery_progress.data_recovered_to,amount,to_read,op.recovery_progress.first && !op.obc,solution_pg_shard_t);
+      }else{
+      	m->read(this, op.hoid, op.recovery_progress.data_recovered_to, amount, to_read, op.recovery_progress.first && !op.obc);
+      }
+      op.extent_requested = make_pair(
+	from,
+	amount);
+      dout(10) << __func__ << ": IDLE return " << op << dendl;
+      return;
+    }
+    case RecoveryOp::READING: {
+      // read completed, start write
+      assert(op.xattrs.size());
+      assert(op.returned_data.size());
+      op.state = RecoveryOp::WRITING;
+      ObjectRecoveryProgress after_progress = op.recovery_progress;
+      after_progress.data_recovered_to += op.extent_requested.second;
+      after_progress.first = false;
+      if (after_progress.data_recovered_to >= op.obc->obs.oi.size) {
+	after_progress.data_recovered_to =
+	  sinfo.logical_to_next_stripe_offset(
+	    op.obc->obs.oi.size);
+	after_progress.data_complete = true;
+      }
+      for (set<pg_shard_t>::iterator mi = op.missing_on.begin();
+	   mi != op.missing_on.end();
+	   ++mi) {
+	assert(op.returned_data.count(mi->shard));
+	m->pushes[*mi].push_back(PushOp());
+	PushOp &pop = m->pushes[*mi].back();
+	pop.soid = op.hoid;
+	pop.version = op.v;
+	pop.data = op.returned_data[mi->shard];
+	dout(10) << __func__ << ": before_progress=" << op.recovery_progress
+		 << ", after_progress=" << after_progress
+		 << ", pop.data.length()=" << pop.data.length()
+		 << ", size=" << op.obc->obs.oi.size << dendl;
+	assert(
+	  pop.data.length() ==
+	  sinfo.aligned_logical_offset_to_chunk_offset(
+	    after_progress.data_recovered_to -
+	    op.recovery_progress.data_recovered_to)
+	  );
+	if (pop.data.length())
+	  pop.data_included.insert(
+	    sinfo.aligned_logical_offset_to_chunk_offset(
+	      op.recovery_progress.data_recovered_to),
+	    pop.data.length()
+	    );
+	if (op.recovery_progress.first) {
+	  pop.attrset = op.xattrs;
+	}
+	pop.recovery_info = op.recovery_info;
+	pop.before_progress = op.recovery_progress;
+	pop.after_progress = after_progress;
+	if (*mi != get_parent()->primary_shard())
+	  get_parent()->begin_peer_recover(
+	    *mi,
+	    op.hoid);
+      }
+      op.returned_data.clear();
+      op.waiting_on_pushes = op.missing_on;
+      op.recovery_progress = after_progress;
+      dout(10) << __func__ << ": READING return " << op << dendl;
+      return;
+    }
+    case RecoveryOp::WRITING: {
+      if (op.waiting_on_pushes.empty()) {
+	if (op.recovery_progress.data_complete) {
+	  op.state = RecoveryOp::COMPLETE;
+	  for (set<pg_shard_t>::iterator i = op.missing_on.begin();
+	       i != op.missing_on.end();
+	       ++i) {
+	    if (*i != get_parent()->primary_shard()) {
+	      dout(10) << __func__ << ": on_peer_recover on " << *i
+		       << ", obj " << op.hoid << dendl;
+	      get_parent()->on_peer_recover(
+		*i,
+		op.hoid,
+		op.recovery_info);
+	    }
+	  }
+	  object_stat_sum_t stat;
+	  stat.num_bytes_recovered = op.recovery_info.size;
+	  stat.num_keys_recovered = 0; // ??? op ... omap_entries.size(); ?
+	  stat.num_objects_recovered = 1;
+	  get_parent()->on_global_recover(op.hoid, stat);
+	  dout(10) << __func__ << ": WRITING return " << op << dendl;
+	  recovery_ops.erase(op.hoid);
+	  if(xor_tech.find(op.hoid) != xor_tech.end())
+	  {
+	  	delete[] parity_group_selection;
+	  	solution_int.erase(solution_int.begin(),solution_int.end());
+	  	solution_pg_shard_t.erase(solution_pg_shard_t.begin(), solution_pg_shard_t.end());
+	  	xor_tech.erase(op.hoid);
+		dout(0) << "ending recovery" << dendl;
+	  }
+	  return;
+	} else {
+	  op.state = RecoveryOp::IDLE;
+	  dout(10) << __func__ << ": WRITING continue " << op << dendl;
+	  continue;
+	}
+      }
+      return;
+    }
+    // should never be called once complete
+    case RecoveryOp::COMPLETE:
+    default: {
+      ceph_abort();
+    };
+    }
+  }
+}
+
+//add by LYF, climb_search
+int ECBackend::different_failed_blocks(int m, int k, int w, int failed_disk_id, int param_row1, int param_row2, int *generator_matrix)
+{
+	for (int j=0;j<w;j++)
+	{
+		if (generator_matrix[param_row1*k*w+failed_disk_id*w+j]!=generator_matrix[param_row2*k*w+failed_disk_id*w+j])
+		{
+			return 1;
+		}
+   	}
+	return 0;
+}
+int ECBackend::count_rows_intersections_num(int m, int k, int w, int failed_disk_id, int param_row1, int param_row2, int *generator_matrix)
+{
+	int intersections_count=0;
+	for (int i=0;i<(k*w);i++)
+	{
+       	if ((i/w)!=failed_disk_id)
+       	{
+       		if ((generator_matrix[param_row1*k*w+i]==0)&&(generator_matrix[param_row2*k*w+i]==0))
+       		{
+       			intersections_count++;
+       		}
+        }
+    }
+    return intersections_count;
+}
+void ECBackend::construct_rows_intersection_infor_matrix(int m, int k, int w, int failed_disk_id, int *generator_matrix)
+{
+	rows_intersection_infor= (int*)malloc(sizeof(int)*(m*w)*(m*w));
+	for (int i=0;i<(m*w);i++)
+	{
+		for (int j=i;j<(m*w);j++) 
+		{
+			if (i==j) 
+			{
+				rows_intersection_infor[i*m*w+j]= -1;
+			}
+			else 
+			{
+             	if (different_failed_blocks(m,k,w,failed_disk_id,i,j,generator_matrix)) 
+             	{
+             		rows_intersection_infor[i*m*w+j]=count_rows_intersections_num(m,k,w,failed_disk_id, i,j,generator_matrix);
+             	}
+				else 
+				{
+					rows_intersection_infor[i*m*w+j]= -1;
+				}
+				rows_intersection_infor[j*m*w+i]=rows_intersection_infor[i*m*w+j];
+			}
+		}
+	}
+}
+int ECBackend::calculate_blocks_savings( int m, int k, int w, int failed_disk_id, int *generator_matrix, int *crs_parity_group_selection) 
+{
+	int blocks_savings=0;
+	for (int i=0;i<k*w;i++) 
+	{
+		if ((i/w)!=failed_disk_id) 
+		{
+			int tmp_saving=1;
+			for (int j=0;j<m*w;j++) 
+			{
+				if (crs_parity_group_selection[j]==1) 
+				{
+					//This parity symbol is selected to participate in recovery
+					if (generator_matrix[j*k*w+i]==1) 
+					{
+						tmp_saving=0;
+						break;
+					}
+				}
+			}
+			blocks_savings=blocks_savings+tmp_saving;
+		}
+	}
+	return blocks_savings;
+}
+void ECBackend::int2bin(int integer, int *binary, int array_len) 
+{
+	int k = 0, n = 0;
+	int remain;
+	int *temp = new int[array_len];
+	do {
+		remain = integer % 2;
+		integer = integer / 2;
+		temp[k++] = remain;
+	} while (integer > 0);
+	//Fill 0 into the convert arra
+	while (k<array_len) 
+	{
+		temp[k++]=0;
+	}
+	while (k >= 0) 
+	{
+		binary[n++] = temp[--k];
+	}
+	delete[] temp;
+}
+int ECBackend::not_in_failed_disk_selection(int m, int k, int w, int failed_disk_id, int *generator_matrix,int row) 
+{
+	int i, j, t;
+	j=0;
+	if (crs_hybrid_parity_group_selection[row]==1) 
+	{
+		return 0;
+	}//The line row is already in the selection and cannot be replaced again
+	int source_num, search_scale;
+	search_scale=0;
+	source_num=0; 
+	for (i=0;i<m*w;i++) 
+	{
+		if (crs_hybrid_parity_group_selection[i]==1) 
+		{
+			source_num++;
+		}
+	}//An option has been deleted, and it should be w-1
+	int* temp_array = new int[source_num];
+	for (i=0;i<m*w;i++) 
+	{
+		if (crs_hybrid_parity_group_selection[i]==1) 
+		{
+			temp_array[j]=i;
+			j++;
+		}
+	}//temp_array saves: the index of 1 in crs_hybrid_parity_group_selection, which represents which parity symbol participates in reconstruction
+	search_scale=1<<source_num; //Be equal to 2^source_num,When source_num is equal to 2, search_scale is equal to 4
+	int* binaryArray=new int[source_num];
+	int* temp_sum = new int[w];
+	for (i=0;i<search_scale;i++) 
+	{
+		memset(temp_sum,0,sizeof(int)*w);
+		int2bin(i,binaryArray,source_num);
+		for (j=0;j<source_num;j++) 
+		{
+			if (binaryArray[j]==1) 
+			{
+				for (t=0;t<w;t++) 
+				{
+					if (generator_matrix[temp_array[j]*k*w+failed_disk_id*w+t]==temp_sum[t]) 
+					{
+						temp_sum[t]=0;
+					} 
+					else 
+					{
+						temp_sum[t]=1;
+					}
+				}
+			}
+		}
+		for (t=0;t<w;t++) 
+		{
+			if (temp_sum[t]!=generator_matrix[row*k*w+failed_disk_id*w+t]) 
+			{
+				break;
+			}
+		}
+		if (t==w) 
+		{
+			return 0;
+		}
+
+	}
+	delete[] temp_array;
+	delete[] temp_sum;
+	delete[] binaryArray;
+	return 1;
+}
+int ECBackend::judge_the_better_candidate(int m, int w, int failed_disk_id, int candidate_one, int candidate_two)
+{
+	int candidate1_sum, candidate2_sum;
+	candidate1_sum=0;
+	candidate2_sum=0;
+	for(int i=0;i<(m*w);i++)
+	{
+		if ((i != candidate_one) && (i != candidate_two) && ((i / w) != failed_disk_id)) 
+		{
+			candidate1_sum = candidate1_sum + rows_intersection_infor[candidate_one*m*w + i];
+		}
+	}
+	for (int i=0;i<(m*w);i++)
+	{
+		if ((i != candidate_one) && (i != candidate_two) && ((i / w) != failed_disk_id))
+		{
+			candidate2_sum = candidate2_sum + rows_intersection_infor[candidate_two*m*w + i];
+		}
+	}
+	if (candidate1_sum>=candidate2_sum)
+	{
+		return 1;
+	} 
+	else 
+	{
+		return 0;
+	}
+}
+int ECBackend::crs_better_recovery_exist(int m, int k, int w, int failed_disk_id, int* candidate_replace_parity_groups, int *generator_matrix)
+{
+	int i, j;
+	int optimal_j= -1; 
+	int selected_candidate= -1;
+	for (i=0;i<(m*w);i++) 
+	{
+		if (candidate_replace_parity_groups[i]== 1) 
+		{
+			for (j=0;j<(m*w);j++) 
+			{
+				if (crs_hybrid_parity_group_selection[j]== 1) 
+				{
+					crs_hybrid_parity_group_selection[j]= 0;
+					if (not_in_failed_disk_selection(m,k,w,failed_disk_id,generator_matrix, i))
+					{
+						crs_hybrid_parity_group_selection[i]=1;
+						int savings=calculate_blocks_savings(m,k,w,failed_disk_id, generator_matrix,crs_hybrid_parity_group_selection);
+						if (savings>crs_hybrid_profit) 
+						{
+							crs_hybrid_profit=savings;
+							optimal_j=j;
+							selected_candidate=i;
+						} 
+						else if (savings==crs_hybrid_profit) 
+						{
+							if (optimal_j == -1) 
+							{
+								crs_hybrid_profit = savings;
+								optimal_j = j;
+								selected_candidate = i;
+							}
+							else if(judge_the_better_candidate(m, w, failed_disk_id,j,optimal_j)== 1) 
+							{
+								crs_hybrid_profit=savings;
+								optimal_j=j;
+								selected_candidate=i;
+							}
+                	    }
+						crs_hybrid_parity_group_selection[i]= 0;
+					}
+					crs_hybrid_parity_group_selection[j]= 1;
+				}
+			}
+		}
+    	}	
+    	if (optimal_j != -1) 
+    	{
+        	crs_hybrid_parity_group_selection[optimal_j]= 0;
+        	crs_hybrid_parity_group_selection[selected_candidate]= 1;
+    	}
+	return selected_candidate;
+}
+void ECBackend::crs_adjust_recovery_vector_in_adjustment(int m, int k, int w, int failed_disk_id, int fixed_parity_node, int star_parity_node, int pre_fixed_parity_node, int *generator_matrix)
+{
+	int i, j;
+	int tmp_replaced;
+	int tmp_crs_hybrid_profit;
+	int* tmp_crs_failed_disk_selection = new int[m*w];
+	tmp_crs_hybrid_profit = crs_hybrid_profit;
+    for (i = 0; i<(m*w); i++) 
+    {
+		tmp_crs_failed_disk_selection[i] = crs_hybrid_parity_group_selection[i];
+	}
+	int* candidate_replace_parity_groups = new int[m*w];
+	for (i = 0; i<m; i++)
+	{
+		if (((i<pre_fixed_parity_node) || (i == star_parity_node)) || (i<fixed_parity_node))
+		{
+			for (j = 0; j<(m*w); j++) 
+			{
+				if ((j / w) == i) 
+				{
+					candidate_replace_parity_groups[j] = 1;
+				}
+				else 
+				{
+					candidate_replace_parity_groups[j] = 0;
+				}
+			}
+			while ((tmp_replaced = crs_better_recovery_exist(m, k, w, failed_disk_id, candidate_replace_parity_groups, generator_matrix)) != -1) 
+			{
+				candidate_replace_parity_groups[tmp_replaced] = 0;
+			}
+		}
+	}
+	if (crs_hybrid_profit <= tmp_crs_hybrid_profit) 
+	{
+		crs_hybrid_profit = tmp_crs_hybrid_profit;
+		for (i = 0; i<(m*w); i++) 
+		{
+			crs_hybrid_parity_group_selection[i] = tmp_crs_failed_disk_selection[i];
+		}
+	}
+	delete[] tmp_crs_failed_disk_selection;
+}
+void ECBackend::crs_adjust_recovery_vector(int m, int k, int w, int failed_disk_id, int fixed_parity_disk, int star_parity_disk, int *generator_matrix)
+{
+	int i, j;
+	int tmp_replaced;
+	int tmp_crs_hybrid_profit;
+	int* tmp_crs_failed_disk_selection = new int[m*w];
+	tmp_crs_hybrid_profit = crs_hybrid_profit;
+	for (i = 0; i<(m*w); i++)
+	{
+		tmp_crs_failed_disk_selection[i] = crs_hybrid_parity_group_selection[i];
+	}
+	int* candidate_replace_parity_groups = new int[m*w];
+	for (i = 0; i<m; i++)
+	{
+		if ((i<fixed_parity_disk) || (i == star_parity_disk))
+		{
+			for (j = 0; j<(m*w); j++)
+			{
+				if ((j / w) == i) 
+				{
+					candidate_replace_parity_groups[j] = 1;
+				}
+				else 
+				{
+					candidate_replace_parity_groups[j] = 0;
+				}
+			}
+			while ((tmp_replaced = crs_better_recovery_exist(m, k, w, failed_disk_id, candidate_replace_parity_groups, generator_matrix)) != -1)
+			{
+				candidate_replace_parity_groups[tmp_replaced] = 0;
+			}
+			crs_adjust_recovery_vector_in_adjustment(m, k, w, failed_disk_id, i, star_parity_disk, fixed_parity_disk, generator_matrix);
+		}
+	}
+	for (i = 0; i<(m*w); i++) 
+	{
+		if ((i / w) == fixed_parity_disk) 
+		{
+			candidate_replace_parity_groups[i] = 1;
+		}
+		else 
+		{
+			candidate_replace_parity_groups[i] = 0;
+		}
+	}
+	while ((tmp_replaced = crs_better_recovery_exist(m, k, w, failed_disk_id, candidate_replace_parity_groups, generator_matrix)) != -1)
+	{
+		candidate_replace_parity_groups[tmp_replaced] = 0;
+	}
+	crs_adjust_recovery_vector_in_adjustment(m, k, w, failed_disk_id, fixed_parity_disk, star_parity_disk, fixed_parity_disk, generator_matrix);
+	if (crs_hybrid_profit <= tmp_crs_hybrid_profit)
+	{
+		crs_hybrid_profit = tmp_crs_hybrid_profit;
+		for (i = 0; i<(m*w); i++)
+		{
+			crs_hybrid_parity_group_selection[i] = tmp_crs_failed_disk_selection[i];
+		}
+	}
+	delete[] tmp_crs_failed_disk_selection;
+	delete[] candidate_replace_parity_groups;
+}
+void ECBackend::crs_store_selection_to_final(int m, int w){
+	for (int i = 0; i<(m*w); i++)
+	{
+		crs_final_recovery_parity_vector[i] = crs_hybrid_parity_group_selection[i];
+	}
+}
+int* ECBackend::crs_hybrid_recovery_solution(int k, int m, int w, int failed_disk_id,int *generator_matrix)
+{
+	crs_hybrid_profit = 0;
+	crs_final_hybrid_profit = 0;
+	int* candidate_replace_parity_groups = new int[m*w];
+	crs_hybrid_parity_group_selection = new int[m*w];
+	crs_final_recovery_parity_vector = new int[m*w];
+	construct_rows_intersection_infor_matrix(m,k,w,failed_disk_id,generator_matrix);
+	for (int i=0;i<(m*w);i++)
+	{
+		crs_hybrid_parity_group_selection[i]=0;
+		candidate_replace_parity_groups[i]=0;
+		crs_final_recovery_parity_vector[i]=0;
+	}
+	int *optimal_conventional_recovery=new int[m];
+	for (int i=0;i<m;i++)
+	{
+		optimal_conventional_recovery[i]=1;
+	}
+	for (int j=0;j<m;j++)
+	{
+		if (optimal_conventional_recovery[j]==1)
+		{
+			for (int i=0;i<(m*w);i++)
+			{
+				if ((i/w)==j)
+				{
+					crs_hybrid_parity_group_selection[i]=1;
+				} 
+				else 
+				{
+					crs_hybrid_parity_group_selection[i]=0;
+				}
+			}
+			crs_hybrid_profit=calculate_blocks_savings(m,k,w,failed_disk_id,generator_matrix,crs_hybrid_parity_group_selection);
+			for (int t=0;t<m;t++)
+			{
+				if (t!=j)
+				{
+					for (int i=0;i<(m*w);i++)
+					{
+						if ((i/w)==t)
+						{
+							candidate_replace_parity_groups[i]= 1;
+						} else 
+						{
+							candidate_replace_parity_groups[i]= 0;
+						}
+					}
+           			int tmp_replaced = crs_better_recovery_exist(m, k, w, failed_disk_id, candidate_replace_parity_groups, generator_matrix);
+					while (tmp_replaced != -1)
+					{
+						candidate_replace_parity_groups[tmp_replaced]= 0;
+						tmp_replaced = crs_better_recovery_exist(m, k, w, failed_disk_id, candidate_replace_parity_groups, generator_matrix);
+					}
+					crs_adjust_recovery_vector(m, k, w, failed_disk_id, t, j, generator_matrix);
+				}
+			}
+		}
+		if (crs_hybrid_profit>=crs_final_hybrid_profit)
+		{
+			crs_final_hybrid_profit = crs_hybrid_profit;
+			crs_store_selection_to_final(m, w);
+		}
+	}	
+	delete[] candidate_replace_parity_groups;
+	delete[] crs_hybrid_parity_group_selection;
+	delete[] optimal_conventional_recovery;
+	delete[] rows_intersection_infor;
+	return crs_final_recovery_parity_vector;
+}
+void ECBackend::get_recovery_solution(int k, int m, int w, int failed_disk_id, int* generator_matrix,int* parity_group_selection, map<int, vector<int> >& solution)
+{
+	int* tmp_recovery_solution;
+	tmp_recovery_solution = new int[k*w];
+	int i, j;
+	for (i = 0; i < k*w;i++) 
+	{
+		for (j = 0; j < m*w;j++) 
+		{
+			if (parity_group_selection[j] == 1) 
+			{
+				if (generator_matrix[j*k*w + i] == 1) 
+				{
+					tmp_recovery_solution[i] = 1;
+					break;
+				}
+			}
+		}
+		if (j == m*w) 
+		{
+			tmp_recovery_solution[i] = 0;
+		}
+	}
+	for (i = 0; i < k*w;i++)
+	{
+		if (i/w == failed_disk_id)
+		{
+		
+		}
+		else if (tmp_recovery_solution[i]== 1)
+		{
+			map<int, vector<int> >::iterator solution_iterator = solution.find(i / w);
+			if (solution_iterator == solution.end())
+			{
+				vector<int> solution_index;
+				solution_index.insert(solution_index.end(), i%w);
+				solution.insert(map<int, vector<int> >::value_type(i / w, solution_index));
+			}
+			else
+			{
+				solution_iterator->second.push_back(i%w);
+			}
+		}
+	}
+	for (i = 0; i < m*w;i++)
+	{
+		if (parity_group_selection[i]== 1)
+		{
+			map<int, vector<int> >::iterator solution_iterator = solution.find(i/w+k);
+			if (solution_iterator == solution.end())
+			{
+				vector<int> solution_index;
+				solution_index.insert(solution_index.end(), i%w);
+				solution.insert(map<int, vector<int> >::value_type(i/w+k, solution_index));
+			}
+			else 
+			{
+				solution_iterator->second.insert(solution_iterator->second.end(), i%w);
+			}
+		}
+	}
+	delete[] tmp_recovery_solution;
+}
+
+//add  by LYF, sa_search
+void ECBackend::init_crs_recovery_equation_group(int k,int m ,int w,int failed_disk_id,int *generator_matrix) {
+	sa_crs_recovery_equation_group = new int*[w];
+	sa_crs_recovery_equation_group_index = new int*[w];
+	sa_crs_recovery_equation_group_index_number = new int[w];
+	for (int i = 0; i < w;i++) {
+		sa_crs_recovery_equation_group[i] = new int[m*w];
+		sa_crs_recovery_equation_group_index_number[i] = 0;
+		for (int j = 0; j < m*w; j++) {
+			sa_crs_recovery_equation_group[i][j] = 0;
+		}
+	}
+	for (int i = 0; i < m*w;i++) {
+		for (int j = 0; j < k*w;j++) {
+			if (j/w==failed_disk_id) {
+				if (generator_matrix[i*k*w+j]==1) {
+					sa_crs_recovery_equation_group[j%w][i] = 1;
+					sa_crs_recovery_equation_group_index_number[j%w]++;
+				}
+			}
+		}
+	}
+	//Initialization: sa_crs_recovery_equation_group_index
+	for (int i = 0; i < w; ++i) {
+		sa_crs_recovery_equation_group_index[i] = new int[sa_crs_recovery_equation_group_index_number[i]];
+		int index = 0;
+		for (int j = 0; j < m*w; ++j) {
+			if (sa_crs_recovery_equation_group[i][j] == 1) {
+				sa_crs_recovery_equation_group_index[i][index++] = j;
+			}
+		}
+	}
+}
+int ECBackend::calculate_row_profit(int k, int w, int row, int faild_disk_id,int *generator_matrix) {
+	int row_profit = 0;
+	for (int i = 0; i < k*w;i++) {
+		if (i/w!= faild_disk_id && generator_matrix[row*k*w+i]==1) {
+			row_profit++;
+		}
+	}
+	return row_profit;
+}
+int ECBackend::calculate_all_profit(int k,int m,int w,int faild_disk_id,int *generator_matrix,int *sa_crs_hybrid_parity_group_selection) {
+	int all_profit = 0;
+	for (int i = 0; i < k*w;i++) {
+		if (i/w!=faild_disk_id) {
+			for (int j = 0; j < m*w; j++) {
+				if (sa_crs_hybrid_parity_group_selection[j]==1) {//The row is selected as a recovery equation to participate in reconstruction
+					if (generator_matrix[j*k*w+i]==1) {
+						all_profit++;
+						break;
+					}
+				}
+			}
+		}
+	}
+	return all_profit;
+}
+bool ECBackend::judge_row_selected(int m,int w, int row) {
+	bool selected = false;
+	for (int i = 0; i < m*w; i++) {
+		if (sa_crs_hybrid_parity_group_selection[row] == 1) {
+			selected = true;
+		}
+	}
+	return selected;
+}
+void ECBackend::init_crs_hybrid_parity_group_selection(int k, int m, int w, int faild_disk_id, int *generator_matrix) {
+	//Randomly select the appropriate recovery solution
+	sa_crs_hybrid_parity_group_selection = new int[m*w];
+	sa_crs_hybrid_parity_group_selection_index = new int[w];
+	for (int i = 0; i < m*w; i++) {
+		sa_crs_hybrid_parity_group_selection[i] = 0;
+	}
+	for (int i = 0; i < w; ++i) {
+		srand((unsigned)time(NULL));
+		int symbol_id = rand() % sa_crs_recovery_equation_group_index_number[i];
+		while (sa_crs_hybrid_parity_group_selection[sa_crs_recovery_equation_group_index[i][symbol_id]] == 1) {
+			symbol_id = rand() % sa_crs_recovery_equation_group_index_number[i];
+		}
+		sa_crs_hybrid_parity_group_selection[sa_crs_recovery_equation_group_index[i][symbol_id]] = 1;
+		sa_crs_hybrid_parity_group_selection_index[i] = sa_crs_recovery_equation_group_index[i][symbol_id];
+	}
+}
+void ECBackend::init_crs_hybrid_parity_group_selection_best(int k,int m,int w, int* generator_matrix) {
+	sa_crs_hybrid_parity_group_selection_best = new int[m*w];
+	sa_crs_hybrid_parity_group_selection_best_index = new int[w];
+	for (int i = 0; i < m*w; ++i) {
+		sa_crs_hybrid_parity_group_selection_best[i] = sa_crs_hybrid_parity_group_selection[i];
+	}
+	for (int i = 0; i < w; ++i) {
+		sa_crs_hybrid_parity_group_selection_best_index[i] = sa_crs_hybrid_parity_group_selection_index[i];
+	}
+}
+void ECBackend::init_crs_hybrid_parity_group_selection_temporary(int k, int m, int w,  int *generator_matrix) {
+	sa_crs_hybrid_parity_group_selection_temporary = new int[m*w];
+	sa_crs_hybrid_parity_group_selection_temporary_index = new int[w];
+	for (int i = 0; i < m*w; i++) {
+		sa_crs_hybrid_parity_group_selection_temporary[i] = sa_crs_hybrid_parity_group_selection[i];
+	}
+	for (int i = 0; i < w; i++) {
+		sa_crs_hybrid_parity_group_selection_temporary_index[i] = sa_crs_hybrid_parity_group_selection_index[i];
+	}
+}
+void ECBackend::receive_replacement(int m,int w) {
+	for (int i = 0; i < m*w; i++) {
+		sa_crs_hybrid_parity_group_selection[i] = sa_crs_hybrid_parity_group_selection_temporary[i];
+	}
+	for (int i = 0; i < w; i++) {
+		sa_crs_hybrid_parity_group_selection_index[i] = sa_crs_hybrid_parity_group_selection_temporary_index[i];
+	}
+}
+void ECBackend::remember_best(int m, int w) {
+	for (int i = 0; i < m*w; ++i) {
+		sa_crs_hybrid_parity_group_selection_best[i] = sa_crs_hybrid_parity_group_selection_temporary[i];
+	}
+	for (int i = 0; i < w; ++i) {
+		sa_crs_hybrid_parity_group_selection_best_index[i] = sa_crs_hybrid_parity_group_selection_temporary_index[i];
+	}
+}
+bool ECBackend::judge_row_selected_temporary(int m, int w, int row) {
+	bool selected = false;
+	if (sa_crs_hybrid_parity_group_selection_temporary[row] == 1) {
+		selected = true;
+	}
+	return selected;
+}
+void ECBackend::sa_int2bin(int integer, int *binary, int array_len) {
+	int k = 0, n = 0;
+	int remain;
+	int *temp = new int[array_len];
+	do {
+		remain = integer % 2;
+		integer = integer / 2;
+		temp[k++] = remain;
+	} while (integer > 0);
+	while (k<array_len) {
+		temp[k++] = 0;
+	}
+	while (k >= 0) {
+		binary[n++] = temp[--k];
+	}
+	delete[] temp;
+}
+bool ECBackend::sa_judge_in_failed_disk_selection(int k,int m,int w,int failed_disk_id,int* generator_matrix,int row, int* temporary_group_id) {
+	if (sa_crs_hybrid_parity_group_selection_temporary[row] == 1) {
+		return true;
+	}
+	int temporary_group_id_index = 0;
+	for (int s = 0; s < k*w; s++) {
+		if (s / w == failed_disk_id) {
+			if (generator_matrix[row*k*w + s] == 1) {
+				temporary_group_id[temporary_group_id_index] = s%w;
+				temporary_group_id_index++;
+			}
+		}
+	}
+	int group_id = temporary_group_id[rand() % temporary_group_id_index];
+	sa_crs_hybrid_parity_group_selection_temporary[sa_crs_hybrid_parity_group_selection_temporary_index[group_id]] = 0;
+	int search_scale = 0;
+	int source_num = 0;
+	for (int i = 0; i < m*w;i++) {
+		if (sa_crs_hybrid_parity_group_selection_temporary[i]==1) {
+			source_num++;
+		}
+	}
+	int* temp_array = new int[source_num];
+	int index = 0;
+	for (int i = 0; i < m*w;i++) {
+		if (sa_crs_hybrid_parity_group_selection_temporary[i]==1) {
+			temp_array[index++] = i;
+		}
+	}
+	search_scale = 1 << source_num;
+	int* binaryArray = new int[source_num];
+	int* temp_sum = new int[w];
+	for (int i = 0; i < search_scale; i++) {
+		memset(temp_sum, 0, sizeof(int)*w);
+		sa_int2bin(i, binaryArray, source_num);
+		for (int j = 0; j<source_num; j++) {
+			if (binaryArray[j] == 1) {
+				for (int t = 0; t<w; t++) {
+					if (generator_matrix[temp_array[j] * k*w + failed_disk_id*w + t] == temp_sum[t]) {
+						temp_sum[t] = 0;
+					}
+					else {
+						temp_sum[t] = 1;
+					}
+				}
+			}
+		}
+		int t = 0;
+		for (t = 0; t<w; t++) {
+			if (temp_sum[t] != generator_matrix[row*k*w + failed_disk_id*w + t]) {
+				break;
+			}
+		}
+		if (t == w) {
+			sa_crs_hybrid_parity_group_selection_temporary[sa_crs_hybrid_parity_group_selection_temporary_index[group_id]] = 1;
+			return true;
+		}
+	}
+	delete[] temp_array;
+	delete[] temp_sum;
+	delete[] binaryArray;
+	sa_crs_hybrid_parity_group_selection_temporary[sa_crs_hybrid_parity_group_selection_temporary_index[group_id]] = 1;
+	return false;
+}
+void ECBackend::sa_search_recovery_solution(int k,int m,int w,int failed_disk_id,int *generator_matrix) {
+	double K = 0.97, T= k*m*m*w*w, M = k*m*m*w*w, L = k*m*m*w*w;
+	double ini = M;
+	double remain_times = ini;
+	double random_probability = 0;
+	int all_profit = 0;
+	int all_profit_new = 0;
+	int all_profit_best = 0;
+	int* temporary_group_id = new int[w];
+	int all_profit_difference = 0;
+	while(remain_times > 0 && T > 0.001) {
+		srand((unsigned)time(NULL));
+		for (int l = 0; l < L; l++) {
+			int symbol_id = rand() % (m*w);
+			while (sa_judge_in_failed_disk_selection(k, m, w, failed_disk_id, generator_matrix, symbol_id, temporary_group_id)) {
+				symbol_id = rand() % (m*w);
+			}
+			int temporary_group_id_index = 0;
+			for (int s = 0; s < k*w; s++) {
+				if (s / w == failed_disk_id) {
+					if (generator_matrix[symbol_id*k*w + s] == 1) {
+						temporary_group_id[temporary_group_id_index] = s%w;
+						temporary_group_id_index++;
+					}
+				}
+			}
+			int group_id = temporary_group_id[rand() % temporary_group_id_index];
+			all_profit = calculate_all_profit(k, m, w, failed_disk_id, generator_matrix,sa_crs_hybrid_parity_group_selection_temporary);
+			all_profit_best = calculate_all_profit(k, m, w, failed_disk_id, generator_matrix, sa_crs_hybrid_parity_group_selection_best);
+			
+			sa_crs_hybrid_parity_group_selection_temporary[sa_crs_hybrid_parity_group_selection_temporary_index[group_id]] = 0;
+			sa_crs_hybrid_parity_group_selection_temporary[symbol_id] = 1;
+			sa_crs_hybrid_parity_group_selection_temporary_index[group_id] = symbol_id;
+
+			all_profit_new = calculate_all_profit(k, m, w, failed_disk_id, generator_matrix, sa_crs_hybrid_parity_group_selection_temporary);
+			all_profit_difference = all_profit - all_profit_new;//The difference between the amount of data before replacement and the amount of data after replacement
+			if (all_profit_difference > 0) {
+				receive_replacement(m, w);
+				if (all_profit_best > all_profit_new) {
+					remember_best(m,w);
+				}
+			}
+			else {
+				random_probability = (double)(rand() / (double)RAND_MAX);
+				if (exp(all_profit_difference / T)>random_probability) {
+					receive_replacement(m, w);
+					T = K*T;
+				}
+				else {
+					remain_times--;
+					sa_crs_hybrid_parity_group_selection_temporary[symbol_id] = 0;
+					sa_crs_hybrid_parity_group_selection_temporary[sa_crs_hybrid_parity_group_selection_index[group_id]] = 1;
+					sa_crs_hybrid_parity_group_selection_temporary_index[group_id] = sa_crs_hybrid_parity_group_selection_index[group_id];
+				}
+			}
+		}
+	}
+	delete[] temporary_group_id;
+	delete[] sa_crs_hybrid_parity_group_selection_temporary;
+	delete[] sa_crs_hybrid_parity_group_selection_temporary_index;
+	delete[] sa_crs_hybrid_parity_group_selection;
+	delete[] sa_crs_hybrid_parity_group_selection_index;
+	delete[] sa_crs_hybrid_parity_group_selection_best_index;
+}
+int* ECBackend::sa_crs_hybrid_recovery_solution(int k, int m, int w, int failed_disk_id, int *generator_matrix) {
+	init_crs_recovery_equation_group(k,m,w,failed_disk_id,generator_matrix);
+	init_crs_hybrid_parity_group_selection(k, m, w, failed_disk_id,generator_matrix);
+	init_crs_hybrid_parity_group_selection_best(k,m,w,generator_matrix);
+	init_crs_hybrid_parity_group_selection_temporary(k, m, w,  generator_matrix);
+	sa_search_recovery_solution(k,m,w,failed_disk_id,generator_matrix);
+	return sa_crs_hybrid_parity_group_selection_best;
+}
+
+map<pg_shard_t, vector<int> > ECBackend::hybrid_recovery_solution(const hobject_t &hoid, int k, int m, int failed_disk_id)
+{
+  int* generator_matrix = ec_impl->get_bitmatrix();
+  int w = ec_impl->get_symbol_count();
+  parity_group_selection = sa_crs_hybrid_recovery_solution(k, m, w, failed_disk_id, generator_matrix);
+  map<int, vector<int> > solution_index;
+  get_recovery_solution(k,m,w, failed_disk_id, generator_matrix,parity_group_selection,solution_index);
+  solution_int = solution_index;
+  map<shard_id_t, pg_shard_t> shards;
+  for (set<pg_shard_t>::const_iterator i = get_parent()->get_acting_shards().begin();i != get_parent()->get_acting_shards().end();++i) 
+  {
+	const pg_missing_t &missing = get_parent()->get_shard_missing(*i);
+	if (!missing.is_missing(hoid))
+	{
+		assert(!shards.count(i->shard));
+      		shards.insert(make_pair(i->shard, *i));
+	}
+  }
+  map<pg_shard_t,vector<int> > solution_final;
+  for(map<int,vector<int> >::iterator solution_index_iter = solution_index.begin(); solution_index_iter != solution_index.end(); ++solution_index_iter)
+  {
+        assert(shards.count(shard_id_t(solution_index_iter->first)));
+        solution_final.insert(make_pair(shards[shard_id_t(solution_index_iter->first)],solution_index_iter->second));
+  }
+  return solution_final;
+}
+
+void ECBackend::run_recovery_op(
+  RecoveryHandle *_h,
+  int priority)
+{
+  ECRecoveryHandle *h = static_cast<ECRecoveryHandle*>(_h);
+  RecoveryMessages m;
+  for (list<RecoveryOp>::iterator i = h->ops.begin();
+       i != h->ops.end();
+       ++i) {
+    dout(10) << __func__ << ": starting " << *i << dendl;
+    assert(!recovery_ops.count(i->hoid));
+    RecoveryOp &op = recovery_ops.insert(make_pair(i->hoid, *i)).first->second;
+    //add by LYF
+    //climb algorithm
+    dout(0) << "starting recovery" << dendl;
+    string profile = get_parent()->get_pool().erasure_code_profile;
+    string technique = get_osdmap()->get_erasure_code_profile(profile).find("technique")->second;
+    set<int> want(op.missing_on_shards.begin(), op.missing_on_shards.end());
+    set<int>::iterator want_iter = want.begin();
+    int failed_disk_id = *want_iter;
+    int data_chunk_count = ec_impl->get_data_chunk_count();
+    int coding_chunk_count = ec_impl->get_coding_chunk_count();
+    if(want.size() == 1 && failed_disk_id < data_chunk_count && (technique == "cauchy_good" || technique == "liber8tion" || technique == "blaum_roth")){
+		solution_pg_shard_t = hybrid_recovery_solution(op.hoid, data_chunk_count, coding_chunk_count, failed_disk_id);
+		xor_tech.insert(make_pair(op.hoid, true));
+    }
+    continue_recovery_op(op, &m);
+  }
+  dispatch_recovery_messages(m, priority);
+  delete _h;
+}
+
+void ECBackend::recover_object(
+  const hobject_t &hoid,
+  eversion_t v,
+  ObjectContextRef head,
+  ObjectContextRef obc,
+  RecoveryHandle *_h)
+{
+  ECRecoveryHandle *h = static_cast<ECRecoveryHandle*>(_h);
+  h->ops.push_back(RecoveryOp());
+  h->ops.back().v = v;
+  h->ops.back().hoid = hoid;
+  h->ops.back().obc = obc;
+  h->ops.back().recovery_info.soid = hoid;
+  h->ops.back().recovery_info.version = v;
+  if (obc) {
+    h->ops.back().recovery_info.size = obc->obs.oi.size;
+    h->ops.back().recovery_info.oi = obc->obs.oi;
+  }
+  h->ops.back().recovery_progress.omap_complete = true;
+  for (set<pg_shard_t>::const_iterator i =
+	 get_parent()->get_actingbackfill_shards().begin();
+       i != get_parent()->get_actingbackfill_shards().end();
+       ++i) {
+    dout(10) << "checking " << *i << dendl;
+    if (get_parent()->get_shard_missing(*i).is_missing(hoid)) {
+      h->ops.back().missing_on.insert(*i);
+      h->ops.back().missing_on_shards.insert(i->shard);
+    }
+  }
+  dout(10) << __func__ << ": built op " << h->ops.back() << dendl;
+}
+
+bool ECBackend::can_handle_while_inactive(
+  OpRequestRef _op)
+{
+  return false;
+}
+
+bool ECBackend::handle_message(
+  OpRequestRef _op)
+{
+  dout(10) << __func__ << ": " << *_op->get_req() << dendl;
+  int priority = _op->get_req()->get_priority();
+  switch (_op->get_req()->get_type()) {
+  case MSG_OSD_EC_WRITE: {
+    // NOTE: this is non-const because handle_sub_write modifies the embedded
+    // ObjectStore::Transaction in place (and then std::move's it).  It does
+    // not conflict with ECSubWrite's operator<<.
+    MOSDECSubOpWrite *op = static_cast<MOSDECSubOpWrite*>(
+      _op->get_nonconst_req());
+    handle_sub_write(op->op.from, _op, op->op);
+    return true;
+  }
+  case MSG_OSD_EC_WRITE_REPLY: {
+    const MOSDECSubOpWriteReply *op = static_cast<const MOSDECSubOpWriteReply*>(
+      _op->get_req());
+    handle_sub_write_reply(op->op.from, op->op);
+    return true;
+  }
+  case MSG_OSD_EC_READ: {
+    const MOSDECSubOpRead *op = static_cast<const MOSDECSubOpRead*>(_op->get_req());
+    MOSDECSubOpReadReply *reply = new MOSDECSubOpReadReply;
+    reply->pgid = get_parent()->primary_spg_t();
+    reply->map_epoch = get_parent()->get_epoch();
+    handle_sub_read(op->op.from, op->op, &(reply->op));
+    get_parent()->send_message_osd_cluster(
+      op->op.from.osd, reply, get_parent()->get_epoch());
+    return true;
+  }
+  case MSG_OSD_EC_READ_REPLY: {
+    // NOTE: this is non-const because handle_sub_read_reply steals resulting
+    // buffers.  It does not conflict with ECSubReadReply operator<<.
+    MOSDECSubOpReadReply *op = static_cast<MOSDECSubOpReadReply*>(
+      _op->get_nonconst_req());
+    RecoveryMessages rm;
+    handle_sub_read_reply(op->op.from, op->op, &rm);
+    dispatch_recovery_messages(rm, priority);
+    return true;
+  }
+  case MSG_OSD_PG_PUSH: {
+    const MOSDPGPush *op = static_cast<const MOSDPGPush *>(_op->get_req());
+    RecoveryMessages rm;
+    for (vector<PushOp>::const_iterator i = op->pushes.begin();
+	 i != op->pushes.end();
+	 ++i) {
+      handle_recovery_push(*i, &rm);
+    }
+    dispatch_recovery_messages(rm, priority);
+    return true;
+  }
+  case MSG_OSD_PG_PUSH_REPLY: {
+    const MOSDPGPushReply *op = static_cast<const MOSDPGPushReply *>(
+      _op->get_req());
+    RecoveryMessages rm;
+    for (vector<PushReplyOp>::const_iterator i = op->replies.begin();
+	 i != op->replies.end();
+	 ++i) {
+      handle_recovery_push_reply(*i, op->from, &rm);
+    }
+    dispatch_recovery_messages(rm, priority);
+    return true;
+  }
+  default:
+    return false;
+  }
+  return false;
+}
+
+struct SubWriteCommitted : public Context {
+  ECBackend *pg;
+  OpRequestRef msg;
+  ceph_tid_t tid;
+  eversion_t version;
+  eversion_t last_complete;
+  SubWriteCommitted(
+    ECBackend *pg,
+    OpRequestRef msg,
+    ceph_tid_t tid,
+    eversion_t version,
+    eversion_t last_complete)
+    : pg(pg), msg(msg), tid(tid),
+      version(version), last_complete(last_complete) {}
+  void finish(int) override {
+    if (msg)
+      msg->mark_event("sub_op_committed");
+    pg->sub_write_committed(tid, version, last_complete);
+  }
+};
+void ECBackend::sub_write_committed(
+  ceph_tid_t tid, eversion_t version, eversion_t last_complete) {
+  if (get_parent()->pgb_is_primary()) {
+    ECSubWriteReply reply;
+    reply.tid = tid;
+    reply.last_complete = last_complete;
+    reply.committed = true;
+    reply.from = get_parent()->whoami_shard();
+    handle_sub_write_reply(
+      get_parent()->whoami_shard(),
+      reply);
+  } else {
+    get_parent()->update_last_complete_ondisk(last_complete);
+    MOSDECSubOpWriteReply *r = new MOSDECSubOpWriteReply;
+    r->pgid = get_parent()->primary_spg_t();
+    r->map_epoch = get_parent()->get_epoch();
+    r->op.tid = tid;
+    r->op.last_complete = last_complete;
+    r->op.committed = true;
+    r->op.from = get_parent()->whoami_shard();
+    r->set_priority(CEPH_MSG_PRIO_HIGH);
+    get_parent()->send_message_osd_cluster(
+      get_parent()->primary_shard().osd, r, get_parent()->get_epoch());
+  }
+}
+
+struct SubWriteApplied : public Context {
+  ECBackend *pg;
+  OpRequestRef msg;
+  ceph_tid_t tid;
+  eversion_t version;
+  SubWriteApplied(
+    ECBackend *pg,
+    OpRequestRef msg,
+    ceph_tid_t tid,
+    eversion_t version)
+    : pg(pg), msg(msg), tid(tid), version(version) {}
+  void finish(int) override {
+    if (msg)
+      msg->mark_event("sub_op_applied");
+    pg->sub_write_applied(tid, version);
+  }
+};
+void ECBackend::sub_write_applied(
+  ceph_tid_t tid, eversion_t version) {
+  parent->op_applied(version);
+  if (get_parent()->pgb_is_primary()) {
+    ECSubWriteReply reply;
+    reply.from = get_parent()->whoami_shard();
+    reply.tid = tid;
+    reply.applied = true;
+    handle_sub_write_reply(
+      get_parent()->whoami_shard(),
+      reply);
+  } else {
+    MOSDECSubOpWriteReply *r = new MOSDECSubOpWriteReply;
+    r->pgid = get_parent()->primary_spg_t();
+    r->map_epoch = get_parent()->get_epoch();
+    r->op.from = get_parent()->whoami_shard();
+    r->op.tid = tid;
+    r->op.applied = true;
+    r->set_priority(CEPH_MSG_PRIO_HIGH);
+    get_parent()->send_message_osd_cluster(
+      get_parent()->primary_shard().osd, r, get_parent()->get_epoch());
+  }
+}
+
+void ECBackend::handle_sub_write(
+  pg_shard_t from,
+  OpRequestRef msg,
+  ECSubWrite &op,
+  Context *on_local_applied_sync)
+{
+  if (msg)
+    msg->mark_started();
+  assert(!get_parent()->get_log().get_missing().is_missing(op.soid));
+  if (!get_parent()->pgb_is_primary())
+    get_parent()->update_stats(op.stats);
+  ObjectStore::Transaction localt;
+  if (!op.temp_added.empty()) {
+    add_temp_objs(op.temp_added);
+  }
+  if (op.backfill) {
+    for (set<hobject_t>::iterator i = op.temp_removed.begin();
+	 i != op.temp_removed.end();
+	 ++i) {
+      dout(10) << __func__ << ": removing object " << *i
+	       << " since we won't get the transaction" << dendl;
+      localt.remove(
+	coll,
+	ghobject_t(
+	  *i,
+	  ghobject_t::NO_GEN,
+	  get_parent()->whoami_shard().shard));
+    }
+  }
+  clear_temp_objs(op.temp_removed);
+  get_parent()->log_operation(
+    op.log_entries,
+    op.updated_hit_set_history,
+    op.trim_to,
+    op.roll_forward_to,
+    !op.backfill,
+    localt);
+
+  PrimaryLogPG *_rPG = dynamic_cast<PrimaryLogPG *>(get_parent());
+  if (_rPG && !_rPG->is_undersized() &&
+      (unsigned)get_parent()->whoami_shard().shard >= ec_impl->get_data_chunk_count())
+    op.t.set_fadvise_flag(CEPH_OSD_OP_FLAG_FADVISE_DONTNEED);
+
+  if (on_local_applied_sync) {
+    dout(10) << "Queueing onreadable_sync: " << on_local_applied_sync << dendl;
+    localt.register_on_applied_sync(on_local_applied_sync);
+  }
+  localt.register_on_commit(
+    get_parent()->bless_context(
+      new SubWriteCommitted(
+	this, msg, op.tid,
+	op.at_version,
+	get_parent()->get_info().last_complete)));
+  localt.register_on_applied(
+    get_parent()->bless_context(
+      new SubWriteApplied(this, msg, op.tid, op.at_version)));
+  vector<ObjectStore::Transaction> tls;
+  tls.reserve(2);
+  tls.push_back(std::move(op.t));
+  tls.push_back(std::move(localt));
+  get_parent()->queue_transactions(tls, msg);
+}
+
+void ECBackend::handle_sub_read(
+  pg_shard_t from,
+  const ECSubRead &op,
+  ECSubReadReply *reply)
+{
+  shard_id_t shard = get_parent()->whoami_shard().shard;
+  for(auto i = op.to_read.begin();
+      i != op.to_read.end();
+      ++i) {
+    int r = 0;
+    ECUtil::HashInfoRef hinfo;
+    if (!get_parent()->get_pool().allows_ecoverwrites()) {
+      hinfo = get_hash_info(i->first);
+      if (!hinfo) {
+	r = -EIO;
+	get_parent()->clog_error() << __func__ << ": No hinfo for " << i->first;
+	dout(5) << __func__ << ": No hinfo for " << i->first << dendl;
+	goto error;
+      }
+    }
+    for (auto j = i->second.begin(); j != i->second.end(); ++j) {
+      bufferlist bl;
+      string profile = get_parent()->get_pool().erasure_code_profile;
+      string technique = get_osdmap()->get_erasure_code_profile(profile).find("technique")->second;
+      if((technique == "cauchy_good" || technique == "liber8tion" || technique =="blaum_roth") && !op.symbol_ids.empty())
+      {
+        int stripe_size = sinfo.get_stripe_width();//add by LYF
+        int chunk_size = sinfo.get_chunk_size();//add by LYF 
+        int packet_size = ec_impl->get_packetsize();//add by LYF
+        int w = ec_impl->get_symbol_count();
+        r = store->read_for_xor(ch,ghobject_t(i->first, ghobject_t::NO_GEN, shard), j->get<0>(), j->get<1>(), bl, stripe_size, chunk_size, packet_size, w, op.symbol_ids, j->get<2>(),true); // Allow EIO return
+      }else{
+      	r = store->read(ch, ghobject_t(i->first, ghobject_t::NO_GEN, shard), j->get<0>(), j->get<1>(), bl, j->get<2>(), true); // Allow EIO return
+      }
+      if (r < 0) {
+	get_parent()->clog_error() << __func__
+				   << ": Error " << r
+				   << " reading "
+				   << i->first;
+	dout(5) << __func__ << ": Error " << r
+		<< " reading " << i->first << dendl;
+	goto error;
+      } else {
+        dout(20) << __func__ << " read request=" << j->get<1>() << " r=" << r << " len=" << bl.length() << dendl;
+	reply->buffers_read[i->first].push_back(
+	  make_pair(
+	    j->get<0>(),
+	    bl)
+	  );
+      }
+
+      if (!get_parent()->get_pool().allows_ecoverwrites()) {
+	// This shows that we still need deep scrub because large enough files
+	// are read in sections, so the digest check here won't be done here.
+	// Do NOT check osd_read_eio_on_bad_digest here.  We need to report
+	// the state of our chunk in case other chunks could substitute.
+	assert(hinfo->has_chunk_hash());
+	if ((bl.length() == hinfo->get_total_chunk_size()) &&
+	    (j->get<0>() == 0)) {
+	  dout(20) << __func__ << ": Checking hash of " << i->first << dendl;
+	  bufferhash h(-1);
+	  h << bl;
+	  if (h.digest() != hinfo->get_chunk_hash(shard)) {
+	    get_parent()->clog_error() << __func__ << ": Bad hash for " << i->first << " digest 0x"
+				       << hex << h.digest() << " expected 0x" << hinfo->get_chunk_hash(shard) << dec;
+	    dout(5) << __func__ << ": Bad hash for " << i->first << " digest 0x"
+		    << hex << h.digest() << " expected 0x" << hinfo->get_chunk_hash(shard) << dec << dendl;
+	    r = -EIO;
+	    goto error;
+	  }
+	}
+      }
+    }
+    continue;
+error:
+    // Do NOT check osd_read_eio_on_bad_digest here.  We need to report
+    // the state of our chunk in case other chunks could substitute.
+    reply->buffers_read.erase(i->first);
+    reply->errors[i->first] = r;
+  }
+  for (set<hobject_t>::iterator i = op.attrs_to_read.begin();
+       i != op.attrs_to_read.end();
+       ++i) {
+    dout(10) << __func__ << ": fulfilling attr request on "
+	     << *i << dendl;
+    if (reply->errors.count(*i))
+      continue;
+    int r = store->getattrs(
+      ch,
+      ghobject_t(
+	*i, ghobject_t::NO_GEN, get_parent()->whoami_shard().shard),
+      reply->attrs_read[*i]);
+    if (r < 0) {
+      reply->buffers_read.erase(*i);
+      reply->errors[*i] = r;
+    }
+  }
+  reply->from = get_parent()->whoami_shard();
+  reply->tid = op.tid;
+}
+
+void ECBackend::handle_sub_write_reply(
+  pg_shard_t from,
+  const ECSubWriteReply &op)
+{
+  map<ceph_tid_t, Op>::iterator i = tid_to_op_map.find(op.tid);
+  assert(i != tid_to_op_map.end());
+  if (op.committed) {
+    assert(i->second.pending_commit.count(from));
+    i->second.pending_commit.erase(from);
+    if (from != get_parent()->whoami_shard()) {
+      get_parent()->update_peer_last_complete_ondisk(from, op.last_complete);
+    }
+  }
+  if (op.applied) {
+    assert(i->second.pending_apply.count(from));
+    i->second.pending_apply.erase(from);
+  }
+
+  if (i->second.pending_apply.empty() && i->second.on_all_applied) {
+    dout(10) << __func__ << " Calling on_all_applied on " << i->second << dendl;
+    i->second.on_all_applied->complete(0);
+    i->second.on_all_applied = 0;
+  }
+  if (i->second.pending_commit.empty() && i->second.on_all_commit) {
+    dout(10) << __func__ << " Calling on_all_commit on " << i->second << dendl;
+    i->second.on_all_commit->complete(0);
+    i->second.on_all_commit = 0;
+  }
+  check_ops();
+}
+
+void ECBackend::handle_sub_read_reply(
+  pg_shard_t from,
+  ECSubReadReply &op,
+  RecoveryMessages *m)
+{
+  dout(10) << __func__ << ": reply " << op << dendl;
+  map<ceph_tid_t, ReadOp>::iterator iter = tid_to_read_map.find(op.tid);
+  if (iter == tid_to_read_map.end()) {
+    //canceled
+    dout(20) << __func__ << ": dropped " << op << dendl;
+    return;
+  }
+  ReadOp &rop = iter->second;
+  for (auto i = op.buffers_read.begin();
+       i != op.buffers_read.end();
+       ++i) {
+    assert(!op.errors.count(i->first));	// If attribute error we better not have sent a buffer
+    if (!rop.to_read.count(i->first)) {
+      // We canceled this read! @see filter_read_op
+      dout(20) << __func__ << " to_read skipping" << dendl;
+      continue;
+    }
+    list<boost::tuple<uint64_t, uint64_t, uint32_t> >::const_iterator req_iter =
+      rop.to_read.find(i->first)->second.to_read.begin();
+    list<
+      boost::tuple<
+	uint64_t, uint64_t, map<pg_shard_t, bufferlist> > >::iterator riter =
+      rop.complete[i->first].returned.begin();
+    for (list<pair<uint64_t, bufferlist> >::iterator j = i->second.begin();
+	 j != i->second.end();
+	 ++j, ++req_iter, ++riter) {
+      assert(req_iter != rop.to_read.find(i->first)->second.to_read.end());
+      assert(riter != rop.complete[i->first].returned.end());
+      pair<uint64_t, uint64_t> adjusted =
+	sinfo.aligned_offset_len_to_chunk(
+	  make_pair(req_iter->get<0>(), req_iter->get<1>()));
+      assert(adjusted.first == j->first);
+      riter->get<2>()[from].claim(j->second);
+    }
+  }
+  for (auto i = op.attrs_read.begin();
+       i != op.attrs_read.end();
+       ++i) {
+    assert(!op.errors.count(i->first));	// if read error better not have sent an attribute
+    if (!rop.to_read.count(i->first)) {
+      // We canceled this read! @see filter_read_op
+      dout(20) << __func__ << " to_read skipping" << dendl;
+      continue;
+    }
+    rop.complete[i->first].attrs = map<string, bufferlist>();
+    (*(rop.complete[i->first].attrs)).swap(i->second);
+  }
+  for (auto i = op.errors.begin();
+       i != op.errors.end();
+       ++i) {
+    rop.complete[i->first].errors.insert(
+      make_pair(
+	from,
+	i->second));
+    dout(20) << __func__ << " shard=" << from << " error=" << i->second << dendl;
+  }
+
+  map<pg_shard_t, set<ceph_tid_t> >::iterator siter =
+					shard_to_read_map.find(from);
+  assert(siter != shard_to_read_map.end());
+  assert(siter->second.count(op.tid));
+  siter->second.erase(op.tid);
+
+  assert(rop.in_progress.count(from));
+  rop.in_progress.erase(from);
+  unsigned is_complete = 0;
+  // For redundant reads check for completion as each shard comes in,
+  // or in a non-recovery read check for completion once all the shards read.
+  // TODO: It would be nice if recovery could send more reads too
+  if (rop.do_redundant_reads || (!rop.for_recovery && rop.in_progress.empty())) {
+    for (map<hobject_t, read_result_t>::const_iterator iter =
+        rop.complete.begin();
+      iter != rop.complete.end();
+      ++iter) {
+      set<int> have;
+      for (map<pg_shard_t, bufferlist>::const_iterator j =
+          iter->second.returned.front().get<2>().begin();
+        j != iter->second.returned.front().get<2>().end();
+        ++j) {
+        have.insert(j->first.shard);
+        dout(20) << __func__ << " have shard=" << j->first.shard << dendl;
+      }
+      set<int> want_to_read, dummy_minimum;
+      get_want_to_read_shards(&want_to_read);
+      int err;
+      if ((err = ec_impl->minimum_to_decode(want_to_read, have, &dummy_minimum)) < 0) {
+	dout(20) << __func__ << " minimum_to_decode failed" << dendl;
+        if (rop.in_progress.empty()) {
+	  // If we don't have enough copies and we haven't sent reads for all shards
+	  // we can send the rest of the reads, if any.
+	  if (!rop.do_redundant_reads) {
+	    int r = send_all_remaining_reads(iter->first, rop);
+	    if (r == 0) {
+	      // We added to in_progress and not incrementing is_complete
+	      continue;
+	    }
+	    // Couldn't read any additional shards so handle as completed with errors
+	  }
+	  if (rop.complete[iter->first].errors.empty()) {
+	    dout(20) << __func__ << " simply not enough copies err=" << err << dendl;
+	  } else {
+	    // Grab the first error
+	    err = rop.complete[iter->first].errors.begin()->second;
+	    dout(20) << __func__ << ": Use one of the shard errors err=" << err << dendl;
+	  }
+	  rop.complete[iter->first].r = err;
+	  ++is_complete;
+	}
+      } else {
+        assert(rop.complete[iter->first].r == 0);
+	if (!rop.complete[iter->first].errors.empty()) {
+	  if (cct->_conf->osd_read_ec_check_for_errors) {
+	    dout(10) << __func__ << ": Not ignoring errors, use one shard err=" << err << dendl;
+	    err = rop.complete[iter->first].errors.begin()->second;
+            rop.complete[iter->first].r = err;
+	  } else {
+	    get_parent()->clog_error() << __func__ << ": Error(s) ignored for "
+				       << iter->first << " enough copies available";
+	    dout(10) << __func__ << " Error(s) ignored for " << iter->first
+		     << " enough copies available" << dendl;
+	    rop.complete[iter->first].errors.clear();
+	  }
+	}
+	++is_complete;
+      }
+    }
+  }
+  if (rop.in_progress.empty() || is_complete == rop.complete.size()) {
+    dout(20) << __func__ << " Complete: " << rop << dendl;
+    complete_read_op(rop, m);
+  } else {
+    dout(10) << __func__ << " readop not complete: " << rop << dendl;
+  }
+}
+
+void ECBackend::complete_read_op(ReadOp &rop, RecoveryMessages *m)
+{
+  map<hobject_t, read_request_t>::iterator reqiter =
+    rop.to_read.begin();
+  map<hobject_t, read_result_t>::iterator resiter =
+    rop.complete.begin();
+  assert(rop.to_read.size() == rop.complete.size());
+  for (; reqiter != rop.to_read.end(); ++reqiter, ++resiter) {
+    if (reqiter->second.cb) {
+      pair<RecoveryMessages *, read_result_t &> arg(
+	m, resiter->second);
+      reqiter->second.cb->complete(arg);
+      reqiter->second.cb = NULL;
+    }
+  }
+  tid_to_read_map.erase(rop.tid);
+}
+
+struct FinishReadOp : public GenContext<ThreadPool::TPHandle&>  {
+  ECBackend *ec;
+  ceph_tid_t tid;
+  FinishReadOp(ECBackend *ec, ceph_tid_t tid) : ec(ec), tid(tid) {}
+  void finish(ThreadPool::TPHandle &handle) override {
+    auto ropiter = ec->tid_to_read_map.find(tid);
+    assert(ropiter != ec->tid_to_read_map.end());
+    int priority = ropiter->second.priority;
+    RecoveryMessages rm;
+    ec->complete_read_op(ropiter->second, &rm);
+    ec->dispatch_recovery_messages(rm, priority);
+  }
+};
+
+void ECBackend::filter_read_op(
+  const OSDMapRef& osdmap,
+  ReadOp &op)
+{
+  set<hobject_t> to_cancel;
+  for (map<pg_shard_t, set<hobject_t> >::iterator i = op.source_to_obj.begin();
+       i != op.source_to_obj.end();
+       ++i) {
+    if (osdmap->is_down(i->first.osd)) {
+      to_cancel.insert(i->second.begin(), i->second.end());
+      op.in_progress.erase(i->first);
+      continue;
+    }
+  }
+
+  if (to_cancel.empty())
+    return;
+
+  for (map<pg_shard_t, set<hobject_t> >::iterator i = op.source_to_obj.begin();
+       i != op.source_to_obj.end();
+       ) {
+    for (set<hobject_t>::iterator j = i->second.begin();
+	 j != i->second.end();
+	 ) {
+      if (to_cancel.count(*j))
+	i->second.erase(j++);
+      else
+	++j;
+    }
+    if (i->second.empty()) {
+      op.source_to_obj.erase(i++);
+    } else {
+      assert(!osdmap->is_down(i->first.osd));
+      ++i;
+    }
+  }
+
+  for (set<hobject_t>::iterator i = to_cancel.begin();
+       i != to_cancel.end();
+       ++i) {
+    get_parent()->cancel_pull(*i);
+
+    assert(op.to_read.count(*i));
+    read_request_t &req = op.to_read.find(*i)->second;
+    dout(10) << __func__ << ": canceling " << req
+	     << "  for obj " << *i << dendl;
+    assert(req.cb);
+    delete req.cb;
+    req.cb = NULL;
+
+    op.to_read.erase(*i);
+    op.complete.erase(*i);
+    recovery_ops.erase(*i);
+  }
+
+  if (op.in_progress.empty()) {
+    get_parent()->schedule_recovery_work(
+      get_parent()->bless_gencontext(
+	new FinishReadOp(this, op.tid)));
+  }
+}
+
+void ECBackend::check_recovery_sources(const OSDMapRef& osdmap)
+{
+  set<ceph_tid_t> tids_to_filter;
+  for (map<pg_shard_t, set<ceph_tid_t> >::iterator 
+       i = shard_to_read_map.begin();
+       i != shard_to_read_map.end();
+       ) {
+    if (osdmap->is_down(i->first.osd)) {
+      tids_to_filter.insert(i->second.begin(), i->second.end());
+      shard_to_read_map.erase(i++);
+    } else {
+      ++i;
+    }
+  }
+  for (set<ceph_tid_t>::iterator i = tids_to_filter.begin();
+       i != tids_to_filter.end();
+       ++i) {
+    map<ceph_tid_t, ReadOp>::iterator j = tid_to_read_map.find(*i);
+    assert(j != tid_to_read_map.end());
+    filter_read_op(osdmap, j->second);
+  }
+}
+
+void ECBackend::on_change()
+{
+  dout(10) << __func__ << dendl;
+
+  completed_to = eversion_t();
+  committed_to = eversion_t();
+  pipeline_state.clear();
+  waiting_reads.clear();
+  waiting_state.clear();
+  waiting_commit.clear();
+  for (auto &&op: tid_to_op_map) {
+    cache.release_write_pin(op.second.pin);
+  }
+  tid_to_op_map.clear();
+
+  for (map<ceph_tid_t, ReadOp>::iterator i = tid_to_read_map.begin();
+       i != tid_to_read_map.end();
+       ++i) {
+    dout(10) << __func__ << ": cancelling " << i->second << dendl;
+    for (map<hobject_t, read_request_t>::iterator j =
+	   i->second.to_read.begin();
+	 j != i->second.to_read.end();
+	 ++j) {
+      delete j->second.cb;
+      j->second.cb = 0;
+    }
+  }
+  tid_to_read_map.clear();
+  in_progress_client_reads.clear();
+  shard_to_read_map.clear();
+  clear_recovery_state();
+}
+
+void ECBackend::clear_recovery_state()
+{
+  recovery_ops.clear();
+}
+
+void ECBackend::on_flushed()
+{
+}
+
+void ECBackend::dump_recovery_info(Formatter *f) const
+{
+  f->open_array_section("recovery_ops");
+  for (map<hobject_t, RecoveryOp>::const_iterator i = recovery_ops.begin();
+       i != recovery_ops.end();
+       ++i) {
+    f->open_object_section("op");
+    i->second.dump(f);
+    f->close_section();
+  }
+  f->close_section();
+  f->open_array_section("read_ops");
+  for (map<ceph_tid_t, ReadOp>::const_iterator i = tid_to_read_map.begin();
+       i != tid_to_read_map.end();
+       ++i) {
+    f->open_object_section("read_op");
+    i->second.dump(f);
+    f->close_section();
+  }
+  f->close_section();
+}
+
+void ECBackend::submit_transaction(
+  const hobject_t &hoid,
+  const object_stat_sum_t &delta_stats,
+  const eversion_t &at_version,
+  PGTransactionUPtr &&t,
+  const eversion_t &trim_to,
+  const eversion_t &roll_forward_to,
+  const vector<pg_log_entry_t> &log_entries,
+  boost::optional<pg_hit_set_history_t> &hset_history,
+  Context *on_local_applied_sync,
+  Context *on_all_applied,
+  Context *on_all_commit,
+  ceph_tid_t tid,
+  osd_reqid_t reqid,
+  OpRequestRef client_op
+  )
+{
+  assert(!tid_to_op_map.count(tid));
+  Op *op = &(tid_to_op_map[tid]);
+  op->hoid = hoid;
+  op->delta_stats = delta_stats;
+  op->version = at_version;
+  op->trim_to = trim_to;
+  op->roll_forward_to = MAX(roll_forward_to, committed_to);
+  op->log_entries = log_entries;
+  std::swap(op->updated_hit_set_history, hset_history);
+  op->on_local_applied_sync = on_local_applied_sync;
+  op->on_all_applied = on_all_applied;
+  op->on_all_commit = on_all_commit;
+  op->tid = tid;
+  op->reqid = reqid;
+  op->client_op = client_op;
+  
+  dout(10) << __func__ << ": op " << *op << " starting" << dendl;
+  start_rmw(op, std::move(t));
+  dout(10) << "onreadable_sync: " << op->on_local_applied_sync << dendl;
+}
+
+void ECBackend::call_write_ordered(std::function<void(void)> &&cb) {
+  if (!waiting_state.empty()) {
+    waiting_state.back().on_write.emplace_back(std::move(cb));
+  } else if (!waiting_reads.empty()) {
+    waiting_reads.back().on_write.emplace_back(std::move(cb));
+  } else {
+    // Nothing earlier in the pipeline, just call it
+    cb();
+  }
+}
+
+int ECBackend::get_min_avail_to_read_shards(
+  const hobject_t &hoid,
+  const set<int> &want,
+  bool for_recovery,
+  bool do_redundant_reads,
+  set<pg_shard_t> *to_read)
+{
+  // Make sure we don't do redundant reads for recovery
+  assert(!for_recovery || !do_redundant_reads);
+
+  set<int> have;
+  map<shard_id_t, pg_shard_t> shards;
+
+  for (set<pg_shard_t>::const_iterator i =
+	 get_parent()->get_acting_shards().begin();
+       i != get_parent()->get_acting_shards().end();
+       ++i) {
+    dout(10) << __func__ << ": checking acting " << *i << dendl;
+    const pg_missing_t &missing = get_parent()->get_shard_missing(*i);
+    if (!missing.is_missing(hoid)) {
+      assert(!have.count(i->shard));
+      have.insert(i->shard);
+      assert(!shards.count(i->shard));
+      shards.insert(make_pair(i->shard, *i));
+    }
+  }
+
+  if (for_recovery) {
+    for (set<pg_shard_t>::const_iterator i =
+	   get_parent()->get_backfill_shards().begin();
+	 i != get_parent()->get_backfill_shards().end();
+	 ++i) {
+      if (have.count(i->shard)) {
+	assert(shards.count(i->shard));
+	continue;
+      }
+      dout(10) << __func__ << ": checking backfill " << *i << dendl;
+      assert(!shards.count(i->shard));
+      const pg_info_t &info = get_parent()->get_shard_info(*i);
+      const pg_missing_t &missing = get_parent()->get_shard_missing(*i);
+      if (hoid < info.last_backfill &&
+	  !missing.is_missing(hoid)) {
+	have.insert(i->shard);
+	shards.insert(make_pair(i->shard, *i));
+      }
+    }
+
+    map<hobject_t, set<pg_shard_t>>::const_iterator miter =
+      get_parent()->get_missing_loc_shards().find(hoid);
+    if (miter != get_parent()->get_missing_loc_shards().end()) {
+      for (set<pg_shard_t>::iterator i = miter->second.begin();
+	   i != miter->second.end();
+	   ++i) {
+	dout(10) << __func__ << ": checking missing_loc " << *i << dendl;
+	auto m = get_parent()->maybe_get_shard_missing(*i);
+	if (m) {
+	  assert(!(*m).is_missing(hoid));
+	}
+	have.insert(i->shard);
+	shards.insert(make_pair(i->shard, *i));
+      }
+    }
+  }
+
+  set<int> need;
+  int r = ec_impl->minimum_to_decode(want, have, &need);
+  if (r < 0)
+    return r;
+
+  if (do_redundant_reads) {
+      need.swap(have);
+  } 
+
+  if (!to_read)
+    return 0;
+
+  for (set<int>::iterator i = need.begin();
+       i != need.end();
+       ++i) {
+    assert(shards.count(shard_id_t(*i)));
+    to_read->insert(shards[shard_id_t(*i)]);
+  }
+  return 0;
+}
+
+int ECBackend::get_min_avail_to_read_shards_hybrid_solution(const hobject_t &hoid,
+	const set<int> &want,
+	bool for_recovery,
+	bool do_redundant_reads,
+	set<pg_shard_t> *to_read,
+	map<pg_shard_t, vector<int> > solution)
+{
+  // Make sure we don't do redundant reads for recovery
+  assert(!for_recovery || !do_redundant_reads);
+  set<int> have;
+  map<shard_id_t, pg_shard_t> shards;
+  
+  for (set<pg_shard_t>::const_iterator i = get_parent()->get_acting_shards().begin(); i != get_parent()->get_acting_shards().end(); ++i) {
+    dout(10) << __func__ << ": checking acting " << *i << dendl;
+    const pg_missing_t &missing = get_parent()->get_shard_missing(*i);
+    if (!missing.is_missing(hoid)) {
+      assert(!have.count(i->shard));
+      have.insert(i->shard);
+      assert(!shards.count(i->shard));
+      shards.insert(make_pair(i->shard, *i));
+    }
+  }
+
+  if (for_recovery) {
+    for (set<pg_shard_t>::const_iterator i = get_parent()->get_backfill_shards().begin(); i != get_parent()->get_backfill_shards().end(); ++i) {
+      if (have.count(i->shard)) {
+	assert(shards.count(i->shard));
+	continue;
+      }
+      dout(10) << __func__ << ": checking backfill " << *i << dendl;
+      assert(!shards.count(i->shard));
+      const pg_info_t &info = get_parent()->get_shard_info(*i);
+      const pg_missing_t &missing = get_parent()->get_shard_missing(*i);
+      if (hoid < info.last_backfill && !missing.is_missing(hoid)) {
+	have.insert(i->shard);
+	shards.insert(make_pair(i->shard, *i));
+      }
+    }
+
+    map<hobject_t, set<pg_shard_t>>::const_iterator miter = get_parent()->get_missing_loc_shards().find(hoid);
+    if (miter != get_parent()->get_missing_loc_shards().end()) {
+      for (set<pg_shard_t>::iterator i = miter->second.begin(); i != miter->second.end(); ++i) {
+	dout(10) << __func__ << ": checking missing_loc " << *i << dendl;
+	auto m = get_parent()->maybe_get_shard_missing(*i);
+	if (m) {
+		assert(!(*m).is_missing(hoid));
+	}
+	have.insert(i->shard);
+	shards.insert(make_pair(i->shard, *i));
+      }
+    }
+  }
+  set<int> solution_index;
+  for(map<pg_shard_t, vector<int> >::iterator solution_iterator = solution.begin(); solution_iterator != solution.end(); ++solution_iterator)
+  {
+	solution_index.insert(solution_iterator->first.shard.id);
+  } 
+  set<int> need;
+  int r = ec_impl->minimum_to_decode(want, have, &need);
+  if (r < 0)
+    return r;
+  if (do_redundant_reads) {
+      need.swap(have);
+  }
+  need.swap(solution_index);
+  if (!to_read)
+    return 0;
+  for (set<int>::iterator i = need.begin(); i != need.end(); ++i) {
+    assert(shards.count(shard_id_t(*i)));
+    to_read->insert(shards[shard_id_t(*i)]);
+  }
+  return 0;
+}
+
+int ECBackend::get_remaining_shards(
+  const hobject_t &hoid,
+  const set<int> &avail,
+  set<pg_shard_t> *to_read)
+{
+  set<int> need;
+  map<shard_id_t, pg_shard_t> shards;
+
+  for (set<pg_shard_t>::const_iterator i =
+	 get_parent()->get_acting_shards().begin();
+       i != get_parent()->get_acting_shards().end();
+       ++i) {
+    dout(10) << __func__ << ": checking acting " << *i << dendl;
+    const pg_missing_t &missing = get_parent()->get_shard_missing(*i);
+    if (!missing.is_missing(hoid)) {
+      assert(!need.count(i->shard));
+      need.insert(i->shard);
+      assert(!shards.count(i->shard));
+      shards.insert(make_pair(i->shard, *i));
+    }
+  }
+
+  if (!to_read)
+    return 0;
+
+  for (set<int>::iterator i = need.begin();
+       i != need.end();
+       ++i) {
+    assert(shards.count(shard_id_t(*i)));
+    if (avail.find(*i) == avail.end())
+      to_read->insert(shards[shard_id_t(*i)]);
+  }
+  return 0;
+}
+
+void ECBackend::start_read_op(
+  int priority,
+  map<hobject_t, read_request_t> &to_read,
+  OpRequestRef _op,
+  bool do_redundant_reads,
+  bool for_recovery)
+{
+  ceph_tid_t tid = get_parent()->get_tid();
+  assert(!tid_to_read_map.count(tid));
+  auto &op = tid_to_read_map.emplace(
+    tid,
+    ReadOp(
+      priority,
+      tid,
+      do_redundant_reads,
+      for_recovery,
+      _op,
+      std::move(to_read))).first->second;
+  dout(10) << __func__ << ": starting " << op << dendl;
+  do_read_op(
+    op);
+}
+
+void ECBackend::do_read_op(ReadOp &op)
+{
+  int priority = op.priority;
+  ceph_tid_t tid = op.tid;
+
+  dout(10) << __func__ << ": starting read " << op << dendl;
+
+  map<pg_shard_t, ECSubRead> messages;
+  for (map<hobject_t, read_request_t>::iterator i = op.to_read.begin();
+       i != op.to_read.end();
+       ++i) {
+    bool need_attrs = i->second.want_attrs;
+    for (set<pg_shard_t>::const_iterator j = i->second.need.begin();
+	 j != i->second.need.end();
+	 ++j) {
+      if (need_attrs) {
+	messages[*j].attrs_to_read.insert(i->first);
+	need_attrs = false;
+      }
+      op.obj_to_source[i->first].insert(*j);
+      op.source_to_obj[*j].insert(i->first);
+    }
+    for (list<boost::tuple<uint64_t, uint64_t, uint32_t> >::const_iterator j =
+	   i->second.to_read.begin();
+	 j != i->second.to_read.end();
+	 ++j) {
+      pair<uint64_t, uint64_t> chunk_off_len =
+	sinfo.aligned_offset_len_to_chunk(make_pair(j->get<0>(), j->get<1>()));
+      for (set<pg_shard_t>::const_iterator k = i->second.need.begin();
+	   k != i->second.need.end();
+	   ++k) {
+	messages[*k].to_read[i->first].push_back(
+	  boost::make_tuple(
+	    chunk_off_len.first,
+	    chunk_off_len.second,
+	    j->get<2>()));
+      }
+      assert(!need_attrs);
+    }
+    for(map<pg_shard_t,vector<int> >::iterator solution_iter = i->second.solution.begin(); solution_iter != i->second.solution.end(); ++solution_iter)
+    {
+		messages[solution_iter->first].symbol_ids = solution_iter->second;
+    }
+  }
+
+  for (map<pg_shard_t, ECSubRead>::iterator i = messages.begin();
+       i != messages.end();
+       ++i) {
+    op.in_progress.insert(i->first);
+    shard_to_read_map[i->first].insert(op.tid);
+    i->second.tid = tid;
+    MOSDECSubOpRead *msg = new MOSDECSubOpRead;
+    msg->set_priority(priority);
+    msg->pgid = spg_t(
+      get_parent()->whoami_spg_t().pgid,
+      i->first.shard);
+    msg->map_epoch = get_parent()->get_epoch();
+    msg->op = i->second;
+    msg->op.from = get_parent()->whoami_shard();
+    msg->op.tid = tid;
+    get_parent()->send_message_osd_cluster(
+      i->first.osd,
+      msg,
+      get_parent()->get_epoch());
+  }
+  dout(10) << __func__ << ": started " << op << dendl;
+}
+
+ECUtil::HashInfoRef ECBackend::get_hash_info(
+  const hobject_t &hoid, bool checks, const map<string,bufferptr> *attrs)
+{
+  dout(10) << __func__ << ": Getting attr on " << hoid << dendl;
+  ECUtil::HashInfoRef ref = unstable_hashinfo_registry.lookup(hoid);
+  if (!ref) {
+    dout(10) << __func__ << ": not in cache " << hoid << dendl;
+    struct stat st;
+    int r = store->stat(
+      ch,
+      ghobject_t(hoid, ghobject_t::NO_GEN, get_parent()->whoami_shard().shard),
+      &st);
+    ECUtil::HashInfo hinfo(ec_impl->get_chunk_count());
+    // XXX: What does it mean if there is no object on disk?
+    if (r >= 0) {
+      dout(10) << __func__ << ": found on disk, size " << st.st_size << dendl;
+      bufferlist bl;
+      if (attrs) {
+	map<string, bufferptr>::const_iterator k = attrs->find(ECUtil::get_hinfo_key());
+	if (k == attrs->end()) {
+	  dout(5) << __func__ << " " << hoid << " missing hinfo attr" << dendl;
+	} else {
+	  bl.push_back(k->second);
+	}
+      } else {
+	r = store->getattr(
+	  ch,
+	  ghobject_t(hoid, ghobject_t::NO_GEN, get_parent()->whoami_shard().shard),
+	  ECUtil::get_hinfo_key(),
+	  bl);
+	if (r < 0) {
+	  dout(5) << __func__ << ": getattr failed: " << cpp_strerror(r) << dendl;
+	  bl.clear(); // just in case
+	}
+      }
+      if (bl.length() > 0) {
+	bufferlist::iterator bp = bl.begin();
+	::decode(hinfo, bp);
+	if (checks && hinfo.get_total_chunk_size() != (uint64_t)st.st_size) {
+	  dout(0) << __func__ << ": Mismatch of total_chunk_size "
+			       << hinfo.get_total_chunk_size() << dendl;
+	  return ECUtil::HashInfoRef();
+	}
+      } else if (st.st_size > 0) { // If empty object and no hinfo, create it
+	return ECUtil::HashInfoRef();
+      }
+    }
+    ref = unstable_hashinfo_registry.lookup_or_create(hoid, hinfo);
+  }
+  return ref;
+}
+
+void ECBackend::start_rmw(Op *op, PGTransactionUPtr &&t)
+{
+  assert(op);
+
+  op->plan = ECTransaction::get_write_plan(
+    sinfo,
+    std::move(t),
+    [&](const hobject_t &i) {
+      ECUtil::HashInfoRef ref = get_hash_info(i, false);
+      if (!ref) {
+	derr << __func__ << ": get_hash_info(" << i << ")"
+	     << " returned a null pointer and there is no "
+	     << " way to recover from such an error in this "
+	     << " context" << dendl;
+	ceph_abort();
+      }
+      return ref;
+    },
+    get_parent()->get_dpp());
+
+  dout(10) << __func__ << ": " << *op << dendl;
+
+  waiting_state.push_back(*op);
+  check_ops();
+}
+
+bool ECBackend::try_state_to_reads()
+{
+  if (waiting_state.empty())
+    return false;
+
+  Op *op = &(waiting_state.front());
+  if (op->requires_rmw() && pipeline_state.cache_invalid()) {
+    assert(get_parent()->get_pool().allows_ecoverwrites());
+    dout(20) << __func__ << ": blocking " << *op
+	     << " because it requires an rmw and the cache is invalid "
+	     << pipeline_state
+	     << dendl;
+    return false;
+  }
+
+  if (op->invalidates_cache()) {
+    dout(20) << __func__ << ": invalidating cache after this op"
+	     << dendl;
+    pipeline_state.invalidate();
+    op->using_cache = false;
+  } else {
+    op->using_cache = pipeline_state.caching_enabled();
+  }
+
+  waiting_state.pop_front();
+  waiting_reads.push_back(*op);
+
+  if (op->using_cache) {
+    cache.open_write_pin(op->pin);
+
+    extent_set empty;
+    for (auto &&hpair: op->plan.will_write) {
+      auto to_read_plan_iter = op->plan.to_read.find(hpair.first);
+      const extent_set &to_read_plan =
+	to_read_plan_iter == op->plan.to_read.end() ?
+	empty :
+	to_read_plan_iter->second;
+
+      extent_set remote_read = cache.reserve_extents_for_rmw(
+	hpair.first,
+	op->pin,
+	hpair.second,
+	to_read_plan);
+
+      extent_set pending_read = to_read_plan;
+      pending_read.subtract(remote_read);
+
+      if (!remote_read.empty()) {
+	op->remote_read[hpair.first] = std::move(remote_read);
+      }
+      if (!pending_read.empty()) {
+	op->pending_read[hpair.first] = std::move(pending_read);
+      }
+    }
+  } else {
+    op->remote_read = op->plan.to_read;
+  }
+
+  dout(10) << __func__ << ": " << *op << dendl;
+
+  if (!op->remote_read.empty()) {
+    assert(get_parent()->get_pool().allows_ecoverwrites());
+    objects_read_async_no_cache(
+      op->remote_read,
+      [this, op](map<hobject_t,pair<int, extent_map> > &&results) {
+	for (auto &&i: results) {
+	  op->remote_read_result.emplace(i.first, i.second.second);
+	}
+	check_ops();
+      });
+  }
+
+  return true;
+}
+
+bool ECBackend::try_reads_to_commit()
+{
+  if (waiting_reads.empty())
+    return false;
+  Op *op = &(waiting_reads.front());
+  if (op->read_in_progress())
+    return false;
+  waiting_reads.pop_front();
+  waiting_commit.push_back(*op);
+
+  dout(10) << __func__ << ": starting commit on " << *op << dendl;
+  dout(20) << __func__ << ": " << cache << dendl;
+
+  get_parent()->apply_stats(
+    op->hoid,
+    op->delta_stats);
+
+  if (op->using_cache) {
+    for (auto &&hpair: op->pending_read) {
+      op->remote_read_result[hpair.first].insert(
+	cache.get_remaining_extents_for_rmw(
+	  hpair.first,
+	  op->pin,
+	  hpair.second));
+    }
+    op->pending_read.clear();
+  } else {
+    assert(op->pending_read.empty());
+  }
+
+  map<shard_id_t, ObjectStore::Transaction> trans;
+  for (set<pg_shard_t>::const_iterator i =
+	 get_parent()->get_actingbackfill_shards().begin();
+       i != get_parent()->get_actingbackfill_shards().end();
+       ++i) {
+    trans[i->shard];
+  }
+
+  map<hobject_t,extent_map> written;
+  if (op->plan.t) {
+    ECTransaction::generate_transactions(
+      op->plan,
+      ec_impl,
+      get_parent()->get_info().pgid.pgid,
+      !get_osdmap()->test_flag(CEPH_OSDMAP_REQUIRE_KRAKEN),
+      sinfo,
+      op->remote_read_result,
+      op->log_entries,
+      &written,
+      &trans,
+      &(op->temp_added),
+      &(op->temp_cleared),
+      get_parent()->get_dpp());
+  }
+
+  dout(20) << __func__ << ": " << cache << dendl;
+  dout(20) << __func__ << ": written: " << written << dendl;
+  dout(20) << __func__ << ": op: " << *op << dendl;
+
+  if (!get_parent()->get_pool().allows_ecoverwrites()) {
+    for (auto &&i: op->log_entries) {
+      if (i.requires_kraken()) {
+	derr << __func__ << ": log entry " << i << " requires kraken"
+	     << " but overwrites are not enabled!" << dendl;
+	ceph_abort();
+      }
+    }
+  }
+
+  map<hobject_t,extent_set> written_set;
+  for (auto &&i: written) {
+    written_set[i.first] = i.second.get_interval_set();
+  }
+  dout(20) << __func__ << ": written_set: " << written_set << dendl;
+  assert(written_set == op->plan.will_write);
+
+  if (op->using_cache) {
+    for (auto &&hpair: written) {
+      dout(20) << __func__ << ": " << hpair << dendl;
+      cache.present_rmw_update(hpair.first, op->pin, hpair.second);
+    }
+  }
+  op->remote_read.clear();
+  op->remote_read_result.clear();
+
+  dout(10) << "onreadable_sync: " << op->on_local_applied_sync << dendl;
+  ObjectStore::Transaction empty;
+  bool should_write_local = false;
+  ECSubWrite local_write_op;
+  for (set<pg_shard_t>::const_iterator i =
+	 get_parent()->get_actingbackfill_shards().begin();
+       i != get_parent()->get_actingbackfill_shards().end();
+       ++i) {
+    op->pending_apply.insert(*i);
+    op->pending_commit.insert(*i);
+    map<shard_id_t, ObjectStore::Transaction>::iterator iter =
+      trans.find(i->shard);
+    assert(iter != trans.end());
+    bool should_send = get_parent()->should_send_op(*i, op->hoid);
+    const pg_stat_t &stats =
+      should_send ?
+      get_info().stats :
+      parent->get_shard_info().find(*i)->second.stats;
+
+    ECSubWrite sop(
+      get_parent()->whoami_shard(),
+      op->tid,
+      op->reqid,
+      op->hoid,
+      stats,
+      should_send ? iter->second : empty,
+      op->version,
+      op->trim_to,
+      op->roll_forward_to,
+      op->log_entries,
+      op->updated_hit_set_history,
+      op->temp_added,
+      op->temp_cleared,
+      !should_send);
+    if (*i == get_parent()->whoami_shard()) {
+      should_write_local = true;
+      local_write_op.claim(sop);
+    } else {
+      MOSDECSubOpWrite *r = new MOSDECSubOpWrite(sop);
+      r->pgid = spg_t(get_parent()->primary_spg_t().pgid, i->shard);
+      r->map_epoch = get_parent()->get_epoch();
+      get_parent()->send_message_osd_cluster(
+	i->osd, r, get_parent()->get_epoch());
+    }
+  }
+  if (should_write_local) {
+      handle_sub_write(
+	get_parent()->whoami_shard(),
+	op->client_op,
+	local_write_op,
+	op->on_local_applied_sync);
+      op->on_local_applied_sync = 0;
+  }
+
+  for (auto i = op->on_write.begin();
+       i != op->on_write.end();
+       op->on_write.erase(i++)) {
+    (*i)();
+  }
+
+  return true;
+}
+
+bool ECBackend::try_finish_rmw()
+{
+  if (waiting_commit.empty())
+    return false;
+  Op *op = &(waiting_commit.front());
+  if (op->write_in_progress())
+    return false;
+  waiting_commit.pop_front();
+
+  dout(10) << __func__ << ": " << *op << dendl;
+  dout(20) << __func__ << ": " << cache << dendl;
+
+  if (op->roll_forward_to > completed_to)
+    completed_to = op->roll_forward_to;
+  if (op->version > committed_to)
+    committed_to = op->version;
+
+  if (get_osdmap()->test_flag(CEPH_OSDMAP_REQUIRE_KRAKEN)) {
+    if (op->version > get_parent()->get_log().get_can_rollback_to() &&
+	waiting_reads.empty() &&
+	waiting_commit.empty()) {
+      // submit a dummy transaction to kick the rollforward
+      auto tid = get_parent()->get_tid();
+      Op *nop = &(tid_to_op_map[tid]);
+      nop->hoid = op->hoid;
+      nop->trim_to = op->trim_to;
+      nop->roll_forward_to = op->version;
+      nop->tid = tid;
+      nop->reqid = op->reqid;
+      waiting_reads.push_back(*nop);
+    }
+  }
+
+  if (op->using_cache) {
+    cache.release_write_pin(op->pin);
+  }
+  tid_to_op_map.erase(op->tid);
+
+  if (waiting_reads.empty() &&
+      waiting_commit.empty()) {
+    pipeline_state.clear();
+    dout(20) << __func__ << ": clearing pipeline_state "
+	     << pipeline_state
+	     << dendl;
+  }
+  return true;
+}
+
+void ECBackend::check_ops()
+{
+  while (try_state_to_reads() ||
+	 try_reads_to_commit() ||
+	 try_finish_rmw());
+}
+
+int ECBackend::objects_read_sync(
+  const hobject_t &hoid,
+  uint64_t off,
+  uint64_t len,
+  uint32_t op_flags,
+  bufferlist *bl)
+{
+  return -EOPNOTSUPP;
+}
+
+void ECBackend::objects_read_async(
+  const hobject_t &hoid,
+  const list<pair<boost::tuple<uint64_t, uint64_t, uint32_t>,
+             pair<bufferlist*, Context*> > > &to_read,
+  Context *on_complete,
+  bool fast_read)
+{
+  map<hobject_t,std::list<boost::tuple<uint64_t, uint64_t, uint32_t> > >
+    reads;
+
+  uint32_t flags = 0;
+  extent_set es;
+  for (list<pair<boost::tuple<uint64_t, uint64_t, uint32_t>,
+	 pair<bufferlist*, Context*> > >::const_iterator i =
+	 to_read.begin();
+       i != to_read.end();
+       ++i) {
+    pair<uint64_t, uint64_t> tmp =
+      sinfo.offset_len_to_stripe_bounds(
+	make_pair(i->first.get<0>(), i->first.get<1>()));
+
+    extent_set esnew;
+    esnew.insert(tmp.first, tmp.second);
+    es.union_of(esnew);
+    flags |= i->first.get<2>();
+  }
+
+  if (!es.empty()) {
+    auto &offsets = reads[hoid];
+    for (auto j = es.begin();
+	 j != es.end();
+	 ++j) {
+      offsets.push_back(
+	boost::make_tuple(
+	  j.get_start(),
+	  j.get_len(),
+	  flags));
+    }
+  }
+
+  struct cb {
+    ECBackend *ec;
+    hobject_t hoid;
+    list<pair<boost::tuple<uint64_t, uint64_t, uint32_t>,
+	      pair<bufferlist*, Context*> > > to_read;
+    unique_ptr<Context> on_complete;
+    cb(const cb&) = delete;
+    cb(cb &&) = default;
+    cb(ECBackend *ec,
+       const hobject_t &hoid,
+       const list<pair<boost::tuple<uint64_t, uint64_t, uint32_t>,
+                  pair<bufferlist*, Context*> > > &to_read,
+       Context *on_complete)
+      : ec(ec),
+	hoid(hoid),
+	to_read(to_read),
+	on_complete(on_complete) {}
+    void operator()(map<hobject_t,pair<int, extent_map> > &&results) {
+      auto dpp = ec->get_parent()->get_dpp();
+      ldpp_dout(dpp, 20) << "objects_read_async_cb: got: " << results
+			 << dendl;
+      ldpp_dout(dpp, 20) << "objects_read_async_cb: cache: " << ec->cache
+			 << dendl;
+
+      auto &got = results[hoid];
+
+      int r = 0;
+      for (auto &&read: to_read) {
+	if (got.first < 0) {
+	  if (read.second.second) {
+	    read.second.second->complete(got.first);
+	  }
+	  if (r == 0)
+	    r = got.first;
+	} else {
+	  assert(read.second.first);
+	  uint64_t offset = read.first.get<0>();
+	  uint64_t length = read.first.get<1>();
+	  auto range = got.second.get_containing_range(offset, length);
+	  assert(range.first != range.second);
+	  assert(range.first.get_off() <= offset);
+	  assert(
+	    (offset + length) <=
+	    (range.first.get_off() + range.first.get_len()));
+	  read.second.first->substr_of(
+	    range.first.get_val(),
+	    offset - range.first.get_off(),
+	    length);
+	  if (read.second.second) {
+	    read.second.second->complete(length);
+	    read.second.second = nullptr;
+	  }
+	}
+      }
+      to_read.clear();
+      if (on_complete) {
+	on_complete.release()->complete(r);
+      }
+    }
+    ~cb() {
+      for (auto &&i: to_read) {
+	delete i.second.second;
+      }
+      to_read.clear();
+    }
+  };
+  objects_read_and_reconstruct(
+    reads,
+    fast_read,
+    make_gen_lambda_context<
+      map<hobject_t,pair<int, extent_map> > &&, cb>(
+	cb(this,
+	   hoid,
+	   to_read,
+	   on_complete)));
+}
+
+struct CallClientContexts :
+  public GenContext<pair<RecoveryMessages*, ECBackend::read_result_t& > &> {
+  hobject_t hoid;
+  ECBackend *ec;
+  ECBackend::ClientAsyncReadStatus *status;
+  list<boost::tuple<uint64_t, uint64_t, uint32_t> > to_read;
+  CallClientContexts(
+    hobject_t hoid,
+    ECBackend *ec,
+    ECBackend::ClientAsyncReadStatus *status,
+    const list<boost::tuple<uint64_t, uint64_t, uint32_t> > &to_read)
+    : hoid(hoid), ec(ec), status(status), to_read(to_read) {}
+  void finish(pair<RecoveryMessages *, ECBackend::read_result_t &> &in) override {
+    ECBackend::read_result_t &res = in.second;
+    extent_map result;
+    if (res.r != 0)
+      goto out;
+    assert(res.returned.size() == to_read.size());
+    assert(res.r == 0);
+    assert(res.errors.empty());
+    for (auto &&read: to_read) {
+      pair<uint64_t, uint64_t> adjusted =
+	ec->sinfo.offset_len_to_stripe_bounds(
+	  make_pair(read.get<0>(), read.get<1>()));
+      assert(res.returned.front().get<0>() == adjusted.first &&
+	     res.returned.front().get<1>() == adjusted.second);
+      map<int, bufferlist> to_decode;
+      bufferlist bl;
+      for (map<pg_shard_t, bufferlist>::iterator j =
+	     res.returned.front().get<2>().begin();
+	   j != res.returned.front().get<2>().end();
+	   ++j) {
+	to_decode[j->first.shard].claim(j->second);
+      }
+      int r = ECUtil::decode(
+	ec->sinfo,
+	ec->ec_impl,
+	to_decode,
+	&bl);
+      if (r < 0) {
+        res.r = r;
+        goto out;
+      }
+      bufferlist trimmed;
+      trimmed.substr_of(
+	bl,
+	read.get<0>() - adjusted.first,
+	MIN(read.get<1>(),
+	    bl.length() - (read.get<0>() - adjusted.first)));
+      result.insert(
+	read.get<0>(), trimmed.length(), std::move(trimmed));
+      res.returned.pop_front();
+    }
+out:
+    status->complete_object(hoid, res.r, std::move(result));
+    ec->kick_reads();
+  }
+};
+
+void ECBackend::objects_read_and_reconstruct(
+  const map<hobject_t,
+    std::list<boost::tuple<uint64_t, uint64_t, uint32_t> >
+  > &reads,
+  bool fast_read,
+  GenContextURef<map<hobject_t,pair<int, extent_map> > &&> &&func)
+{
+  in_progress_client_reads.emplace_back(
+    reads.size(), std::move(func));
+  if (!reads.size()) {
+    kick_reads();
+    return;
+  }
+
+  set<int> want_to_read;
+  get_want_to_read_shards(&want_to_read);
+    
+  map<hobject_t, read_request_t> for_read_op;
+  for (auto &&to_read: reads) {
+    set<pg_shard_t> shards;
+    int r = get_min_avail_to_read_shards(
+      to_read.first,
+      want_to_read,
+      false,
+      fast_read,
+      &shards);
+    assert(r == 0);
+
+    CallClientContexts *c = new CallClientContexts(
+      to_read.first,
+      this,
+      &(in_progress_client_reads.back()),
+      to_read.second);
+    for_read_op.insert(
+      make_pair(
+	to_read.first,
+	read_request_t(
+	  to_read.second,
+	  shards,
+	  false,
+	  c)));
+  }
+
+  start_read_op(
+    CEPH_MSG_PRIO_DEFAULT,
+    for_read_op,
+    OpRequestRef(),
+    fast_read, false);
+  return;
+}
+
+
+int ECBackend::send_all_remaining_reads(
+  const hobject_t &hoid,
+  ReadOp &rop)
+{
+  set<int> already_read;
+  const set<pg_shard_t>& ots = rop.obj_to_source[hoid];
+  for (set<pg_shard_t>::iterator i = ots.begin(); i != ots.end(); ++i)
+    already_read.insert(i->shard);
+  dout(10) << __func__ << " have/error shards=" << already_read << dendl;
+  set<pg_shard_t> shards;
+  int r = get_remaining_shards(hoid, already_read, &shards);
+  if (r)
+    return r;
+  if (shards.empty())
+    return -EIO;
+
+  dout(10) << __func__ << " Read remaining shards " << shards << dendl;
+
+  // TODOSAM: this doesn't seem right
+  list<boost::tuple<uint64_t, uint64_t, uint32_t> > offsets =
+    rop.to_read.find(hoid)->second.to_read;
+  GenContext<pair<RecoveryMessages *, read_result_t& > &> *c =
+    rop.to_read.find(hoid)->second.cb;
+
+  map<hobject_t, read_request_t> for_read_op;
+  for_read_op.insert(
+    make_pair(
+      hoid,
+      read_request_t(
+	offsets,
+	shards,
+	false,
+	c)));
+
+  rop.to_read.swap(for_read_op);
+  do_read_op(rop);
+  return 0;
+}
+
+int ECBackend::objects_get_attrs(
+  const hobject_t &hoid,
+  map<string, bufferlist> *out)
+{
+  int r = store->getattrs(
+    ch,
+    ghobject_t(hoid, ghobject_t::NO_GEN, get_parent()->whoami_shard().shard),
+    *out);
+  if (r < 0)
+    return r;
+
+  for (map<string, bufferlist>::iterator i = out->begin();
+       i != out->end();
+       ) {
+    if (ECUtil::is_hinfo_key_string(i->first))
+      out->erase(i++);
+    else
+      ++i;
+  }
+  return r;
+}
+
+void ECBackend::rollback_append(
+  const hobject_t &hoid,
+  uint64_t old_size,
+  ObjectStore::Transaction *t)
+{
+  assert(old_size % sinfo.get_stripe_width() == 0);
+  t->truncate(
+    coll,
+    ghobject_t(hoid, ghobject_t::NO_GEN, get_parent()->whoami_shard().shard),
+    sinfo.aligned_logical_offset_to_chunk_offset(
+      old_size));
+}
+
+void ECBackend::be_deep_scrub(
+  const hobject_t &poid,
+  uint32_t seed,
+  ScrubMap::object &o,
+  ThreadPool::TPHandle &handle) {
+  bufferhash h(-1); // we always used -1
+  int r;
+  uint64_t stride = cct->_conf->osd_deep_scrub_stride;
+  if (stride % sinfo.get_chunk_size())
+    stride += sinfo.get_chunk_size() - (stride % sinfo.get_chunk_size());
+  uint64_t pos = 0;
+
+  uint32_t fadvise_flags = CEPH_OSD_OP_FLAG_FADVISE_SEQUENTIAL | CEPH_OSD_OP_FLAG_FADVISE_DONTNEED;
+
+  while (true) {
+    bufferlist bl;
+    handle.reset_tp_timeout();
+    r = store->read(
+      ch,
+      ghobject_t(
+	poid, ghobject_t::NO_GEN, get_parent()->whoami_shard().shard),
+      pos,
+      stride, bl,
+      fadvise_flags, true);
+    if (r < 0)
+      break;
+    if (bl.length() % sinfo.get_chunk_size()) {
+      r = -EIO;
+      break;
+    }
+    pos += r;
+    h << bl;
+    if ((unsigned)r < stride)
+      break;
+  }
+
+  if (r == -EIO) {
+    dout(0) << "_scan_list  " << poid << " got "
+	    << r << " on read, read_error" << dendl;
+    o.read_error = true;
+    return;
+  }
+
+  ECUtil::HashInfoRef hinfo = get_hash_info(poid, false, &o.attrs);
+  if (!hinfo) {
+    dout(0) << "_scan_list  " << poid << " could not retrieve hash info" << dendl;
+    o.read_error = true;
+    o.digest_present = false;
+    return;
+  } else {
+    if (!get_parent()->get_pool().allows_ecoverwrites()) {
+      assert(hinfo->has_chunk_hash());
+      if (hinfo->get_total_chunk_size() != pos) {
+	dout(0) << "_scan_list  " << poid << " got incorrect size on read" << dendl;
+	o.ec_size_mismatch = true;
+	return;
+      }
+
+      if (hinfo->get_chunk_hash(get_parent()->whoami_shard().shard) != h.digest()) {
+	dout(0) << "_scan_list  " << poid << " got incorrect hash on read" << dendl;
+	o.ec_hash_mismatch = true;
+	return;
+      }
+
+      /* We checked above that we match our own stored hash.  We cannot
+       * send a hash of the actual object, so instead we simply send
+       * our locally stored hash of shard 0 on the assumption that if
+       * we match our chunk hash and our recollection of the hash for
+       * chunk 0 matches that of our peers, there is likely no corruption.
+       */
+      o.digest = hinfo->get_chunk_hash(0);
+      o.digest_present = true;
+    } else {
+      /* Hack! We must be using partial overwrites, and partial overwrites
+       * don't support deep-scrub yet
+       */
+      o.digest = 0;
+      o.digest_present = true;
+    }
+  }
+
+  o.omap_digest = seed;
+  o.omap_digest_present = true;
+}
