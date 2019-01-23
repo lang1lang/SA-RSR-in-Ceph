@@ -1,0 +1,12 @@
+# Functions added in the Jerasure library
+int jerasure_schedule_decode_lazy_hybrid_solution(int k, int m, int w, int *bitmatrix, int *erasures, char **data_ptrs, char *coding_ptrs, int size, int packetsize, int* parity_group_selection, Control* control) //Call function of jerasure library
+static char **set_up_ptrs_for_scheduled_decoding_hybrid_solution(int k, int m, int *erasures, char **data_ptrs, char *coding_ptrs) //Sets the pointer for the XOR operation, which points to a location in the block
+int **jerasure_generate_decoding_schedule_hybrid_solution(int k, int m, int w, int *bitmatrix, int *erasures, int* parity_group_selection, Control* control) //Generate the schedule strategy for XOR-based code decoding
+static int set_up_ids_for_scheduled_decoding_hybrid_solution(int k, int m, int *erasures, int *row_ids, int *ind_to_row) //Set IDs for scheduling when decoding
+int **jerasure_dumb_bitmatrix_to_schedule_hybrid_solution(int k, int m, int w, int *bitmatrix, Control* control) //Generate Schedule Strategy Based on the Decoding Matrix
+int find_key(Node_info* node_info, int num); //Obtain the corresponding information from control
+int get_Node_symbol_numbers(int i, Control* control); //Obtain the number of symbols read from a node
+
+# Note that we introduce a new header file
+#include "control.h"
+# control.h is in the include directory

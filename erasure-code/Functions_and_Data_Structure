@@ -1,0 +1,69 @@
+# Function Declarations in ErasureCodeInterface.h
+virtual unsigned int get_symbol_count() const = 0;
+virtual int* get_bitmatrix() = 0;
+virtual int get_packetsize() = 0;
+virtual int decode_for_xor(const set<int> &want_to_read,
+          const map<int, bufferlist> &chunks,
+          map<int, bufferlist> *decoded,
+          uint64_t chunk_size,
+          int packet_size,
+          int w,
+          map<int,vector<int> > solution,
+          int* parity_group_selection) = 0;
+virtual int decode_chunks_for_xor(const set<int> &want_to_read,
+          const map<int, bufferlist> &chunks,
+          map<int, bufferlist> *decoded,
+          unsigned blocksize,
+          int packet_size,
+          int w,
+          map<int,vector<int> > solution,
+          int* parity_group_selection) = 0;
+
+# Function Declarations in ErasureCode.h
+class ErasureCode : public ErasureCodeInterface {
+public:
+    unsigned int get_symbol_count() const override {
+       return 0;
+    }
+    int* get_bitmatrix() override {
+      return 0;
+    }
+    int get_packetsize() override {
+      return 0;
+    }
+    int decode_for_xor(const set<int> &want_to_read,
+            const map<int, bufferlist> &chunks,
+            map<int, bufferlist> *decoded,
+            uint64_t chunk_size,
+            int packet_size,
+            int w,
+            map<int,vector<int> > solution,
+            int* parity_group_selection) override;
+    int decode_chunks_for_xor(const set<int> &want_to_read,
+            const map<int, bufferlist> &chunks,
+            map<int, bufferlist> *decoded,
+            unsigned blocksize,
+            int packet_size,
+            int w,
+            map<int,vector<int> > solution,
+            int* parity_group_selection) override;
+};
+
+# Corresponding Functions in ErasureCode.cc
+int ErasureCode::decode_for_xor(const set<int> &want_to_read,
+            const map<int, bufferlist> &chunks,
+            map<int, bufferlist> *decoded,
+            uint64_t chunk_size,
+            int packet_size,
+            int w,
+            map<int,vector<int> > solution,
+            int* parity_group_selection);
+int ErasureCode::decode_chunks_for_xor(const set<int> &want_to_read,
+            const map<int, bufferlist> &chunks,
+            map<int, bufferlist> *decoded,
+            unsigned blocksize,
+            int packet_size,
+            int w,
+            map<int,vector<int> > solution,
+            int* parity_group_selection);
+

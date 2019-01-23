@@ -1,0 +1,30 @@
+# Functions added in the Jerasure library Plug-In Infrastructure
+# Note that we introduce a new header file 
+extern "C" {
+#include "control.h"
+}
+class ErasureCodeJerasure : public ErasureCode {
+public:
+  unsigned int get_symbol_count() const override {//Obtain w, i.e., number of symbols in each data block and parity block
+    return w;
+  }
+  int decode_chunks_for_xor(const set<int> &want_to_read,
+      const map<int, bufferlist> &chunks,
+      map<int, bufferlist> *decoded,
+      unsigned blocksize,
+      int packet_size,
+      int w,
+      map<int,vector<int> > solution,
+      int* parity_group_selection) override;
+  void get_Control(int k, int w, map<int, vector<int> > solution, Control* control); //Obtain Control scheme, which is used for decoding in Jerasure library
+  int* get_bitmatrix() override; //Obtain the generator matrix
+  int get_packetsize() override; //Obtain the packetsize, which is the physical size for each symbol 
+  virtual int jerasure_decode_for_xor(int *erasures,
+            char **data,
+            char *coding,
+            int blocksize,
+            int* parity_group_selection,
+            Control* control) = 0;
+  virtual int* get_matrix() = 0;
+  virtual int get_symbol_size() = 0;
+};
