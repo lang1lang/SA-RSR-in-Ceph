@@ -1,4 +1,3 @@
-# Function Description
 # Data Structures in ECMsgTypes.h
 struct ECSubRead {
   pg_shard_t from;
