@@ -1,0 +1,133 @@
+#Function Declarations in ObjectStore.h
+virtual int read_for_xor(
+    const coll_t& cid,
+    const ghobject_t& oid,
+    uint64_t offset,
+    size_t len,
+    bufferlist& bl,
+    int stripe_size,
+    int chunk_size,
+    int packet_size,
+    int w,
+    vector<int> symbol_ids,
+    uint32_t op_flags = 0,
+    bool allow_eio = false) = 0;
+
+virtual int read_for_xor(
+     CollectionHandle &c,
+     const ghobject_t& oid,
+     uint64_t offset,
+     size_t len,
+     bufferlist& bl,
+     int stripe_size,
+     int chunk_size,
+     int packet_size,
+     int w,
+     vector<int> symbol_ids,
+     uint32_t op_flags = 0,
+     bool allow_eio = false) {
+     return read_for_xor(c->get_cid(), oid, offset, len, bl, stripe_size, chunk_size, packet_size, w, symbol_ids, op_flags, allow_eio);
+   }
+
+#Function Declarations in bluestore/BlueStore.h
+int read_for_xor(
+    const coll_t& cid,
+    const ghobject_t& oid,
+    uint64_t offset,
+    size_t len,
+    bufferlist& bl,
+    int stripe_size,
+    int chunk_size,
+    int packet_size,
+    int w,
+    vector<int> symbol_ids,
+    uint32_t op_flags = 0,
+    bool allow_eio = false) override{return -1;}
+
+int read_for_xor(
+    CollectionHandle &c,
+    const ghobject_t& oid,
+    uint64_t offset,
+    size_t len,
+    bufferlist& bl,
+    int stripe_size,
+    int chunk_size,
+    int packet_size,
+    int w,
+    vector<int> symbol_ds,
+    uint32_t op_flags = 0,
+    bool allow_eio = false) override{return -1;}
+
+#Function Declarations in kstore/KStore.h
+int read_for_xor(
+    const coll_t& cid,
+    const ghobject_t& oid,
+    uint64_t offset,
+    size_t len,
+    bufferlist& bl,
+    int stripe_size,
+    int chunk_size,
+    int packet_size,
+    int w,
+    vector<int> symbol_ids,
+    uint32_t op_flags = 0,
+    bool allow_eio = false) override{return -1;}
+
+#Function Declarations in memstore/MemStore.h
+int read_for_xor(
+    const coll_t& cid,
+    const ghobject_t& oid,
+    uint64_t offset,
+    size_t len,
+    bufferlist& bl,
+    int stripe_size,
+    int chunk_size,
+    int packet_size,
+    int w,
+    vector<int> symbol_ids,
+    uint32_t op_flags = 0,
+    bool allow_eio = false) override{return -1;}
+int read_for_xor(
+    CollectionHandle &c,
+    const ghobject_t& oid,
+    uint64_t offset,
+    size_t len,
+    bufferlist& bl,
+    int stripe_size,
+    int chunk_size,
+    int packet_size,
+    int w,
+    vector<int> symbol_ids,
+    uint32_t op_flags = 0,
+    bool allow_eio = false) override{return -1;}
+
+#Function Declarations in filestore/FileStore.h
+int read_for_xor(
+    const coll_t& cid,
+    const ghobject_t& oid,
+    uint64_t offset,
+    size_t len,
+    bufferlist& bl,
+    int stripe_size,
+    int chunk_size,
+    int packet_size,
+    int w,
+    vector<int> symbol_ids,
+    uint32_t op_flags = 0,
+    bool allow_eio = false) override;
+
+# Corresponding Functions in filestore/FileStore.cc
+int FileStore::read_for_xor(
+  const coll_t& _cid,
+  const ghobject_t& oid,
+  uint64_t offset,
+  size_t len,
+  bufferlist& bl,
+  int stripe_size,
+  int chunk_size,
+  int packet_size,
+  int w,
+  vector<int> symbol_ids,
+  uint32_t op_flags,
+  bool allow_eio); //read the corresponding symbol data from the current node
+
